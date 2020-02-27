@@ -21,19 +21,24 @@ package org.apache.flink.table.expressions;
 import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.functions.ScalarFunction;
+import org.apache.flink.table.functions.ScalarFunctionDefinition;
 
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.ExpectedException;
 
 import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
 import java.sql.Timestamp;
 import java.time.LocalDateTime;
+import java.time.Period;
+import java.util.HashMap;
+import java.util.Map;
 
 import static java.util.Arrays.asList;
 import static java.util.Collections.singletonList;
-import static org.apache.flink.table.expressions.BuiltInFunctionDefinitions.AND;
-import static org.apache.flink.table.expressions.BuiltInFunctionDefinitions.EQUALS;
+import static org.apache.flink.table.functions.BuiltInFunctionDefinitions.AND;
+import static org.apache.flink.table.functions.BuiltInFunctionDefinitions.EQUALS;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
 
@@ -69,6 +74,27 @@ public class ExpressionTest {
 	}
 
 	@Test
+	public void testArrayValueLiteralEquality() {
+		assertEquals(
+			new ValueLiteralExpression(new Integer[][]{null, null, {1, 2, 3}}),
+			new ValueLiteralExpression(new Integer[][]{null, null, {1, 2, 3}}));
+
+		assertEquals(
+			new ValueLiteralExpression(
+				new String[][]{null, null, {"1", "2", "3", "Dog's"}},
+				DataTypes.ARRAY(DataTypes.ARRAY(DataTypes.STRING()))),
+			new ValueLiteralExpression(
+				new String[][]{null, null, {"1", "2", "3", "Dog's"}},
+				DataTypes.ARRAY(DataTypes.ARRAY(DataTypes.STRING())))
+		);
+
+		assertEquals(
+			new ValueLiteralExpression("abc".getBytes(StandardCharsets.UTF_8)),
+			new ValueLiteralExpression("abc".getBytes(StandardCharsets.UTF_8))
+		);
+	}
+
+	@Test
 	public void testExpressionInequality() {
 		assertNotEquals(TREE_WITH_NULL, TREE_WITH_VALUE);
 	}
@@ -84,6 +110,23 @@ public class ExpressionTest {
 			new ValueLiteralExpression(
 					new String[][]{null, null, {"1", "2", "3", "Dog's"}},
 					DataTypes.ARRAY(DataTypes.ARRAY(DataTypes.STRING())))
+				.toString());
+
+		final Map<String, Integer> map = new HashMap<>();
+		map.put("key1", 1);
+		map.put("key2", 2);
+		map.put("key3", 3);
+		assertEquals(
+			"{key1=1, key2=2, key3=3}",
+			new ValueLiteralExpression(
+					map,
+					DataTypes.MAP(DataTypes.STRING(), DataTypes.INT()))
+				.toString());
+		assertEquals(
+			"{key1=1, key2=2, key3=3}",
+			new ValueLiteralExpression(
+					map,
+					DataTypes.MULTISET(DataTypes.STRING()))
 				.toString());
 	}
 
@@ -140,6 +183,16 @@ public class ExpressionTest {
 				.orElseThrow(AssertionError::new));
 	}
 
+	@Test
+	public void testPeriodValueLiteralExtraction() {
+		final Period period = Period.ofMonths(10);
+		Integer expectedValue = 10;
+		assertEquals(
+			expectedValue,
+			new ValueLiteralExpression(period).getValueAs(Integer.class)
+				.orElseThrow(AssertionError::new));
+	}
+
 	// --------------------------------------------------------------------------------------------
 
 	private static Expression createExpressionTree(Integer nestedValue) {
@@ -153,11 +206,14 @@ public class ExpressionTest {
 						new FieldReferenceExpression("field", DataTypes.INT(), 0, 0),
 						new CallExpression(
 							new ScalarFunctionDefinition("dummy", DUMMY_FUNCTION),
-							singletonList(new ValueLiteralExpression(nestedValue, DataTypes.INT()))
+							singletonList(new ValueLiteralExpression(nestedValue, DataTypes.INT())),
+							DataTypes.INT()
 						)
-					)
+					),
+					DataTypes.BOOLEAN()
 				)
-			)
+			),
+			DataTypes.BOOLEAN()
 		);
 	}
 }

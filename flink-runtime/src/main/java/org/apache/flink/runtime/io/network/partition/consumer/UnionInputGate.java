@@ -86,9 +86,6 @@ public class UnionInputGate extends InputGate {
 	 */
 	private final Map<InputGate, Integer> inputGateToIndexOffsetMap;
 
-	/** Flag indicating whether partitions have been requested. */
-	private boolean requestedPartitionsFlag;
-
 	public UnionInputGate(InputGate... inputGates) {
 		this.inputGates = checkNotNull(inputGates);
 		checkArgument(inputGates.length > 1, "Union input gate should union at least two input gates.");
@@ -111,7 +108,7 @@ public class UnionInputGate extends InputGate {
 
 				currentNumberOfInputChannels += inputGate.getNumberOfInputChannels();
 
-				CompletableFuture<?> available = inputGate.isAvailable();
+				CompletableFuture<?> available = inputGate.getAvailableFuture();
 
 				if (available.isDone()) {
 					inputGatesWithData.add(inputGate);
@@ -121,7 +118,7 @@ public class UnionInputGate extends InputGate {
 			}
 
 			if (!inputGatesWithData.isEmpty()) {
-				isAvailable = AVAILABLE;
+				availabilityHelper.resetAvailable();
 			}
 		}
 
@@ -142,17 +139,6 @@ public class UnionInputGate extends InputGate {
 	}
 
 	@Override
-	public void requestPartitions() throws IOException, InterruptedException {
-		if (!requestedPartitionsFlag) {
-			for (InputGate inputGate : inputGates) {
-				inputGate.requestPartitions();
-			}
-
-			requestedPartitionsFlag = true;
-		}
-	}
-
-	@Override
 	public Optional<BufferOrEvent> getNext() throws IOException, InterruptedException {
 		return getNextBufferOrEvent(true);
 	}
@@ -166,9 +152,6 @@ public class UnionInputGate extends InputGate {
 		if (inputGatesWithRemainingData.isEmpty()) {
 			return Optional.empty();
 		}
-
-		// Make sure to request the partitions, if they have not been requested before.
-		requestPartitions();
 
 		Optional<InputWithData<InputGate, BufferOrEvent>> next = waitAndGetNextData(blocking);
 		if (!next.isPresent()) {
@@ -202,11 +185,11 @@ public class UnionInputGate extends InputGate {
 					// enqueue the inputGate at the end to avoid starvation
 					inputGatesWithData.add(inputGate.get());
 				} else if (!inputGate.get().isFinished()) {
-					inputGate.get().isAvailable().thenRun(() -> queueInputGate(inputGate.get()));
+					inputGate.get().getAvailableFuture().thenRun(() -> queueInputGate(inputGate.get()));
 				}
 
 				if (inputGatesWithData.isEmpty()) {
-					resetIsAvailable();
+					availabilityHelper.resetUnavailable();
 				}
 
 				if (bufferOrEvent.isPresent()) {
@@ -249,12 +232,11 @@ public class UnionInputGate extends InputGate {
 	}
 
 	private void markAvailable() {
-		CompletableFuture<?> toNotfiy;
+		CompletableFuture<?> toNotify;
 		synchronized (inputGatesWithData) {
-			toNotfiy = isAvailable;
-			isAvailable = AVAILABLE;
+			toNotify = availabilityHelper.getUnavailableToResetAvailable();
 		}
-		toNotfiy.complete(null);
+		toNotify.complete(null);
 	}
 
 	@Override
@@ -262,19 +244,6 @@ public class UnionInputGate extends InputGate {
 		for (InputGate inputGate : inputGates) {
 			inputGate.sendTaskEvent(event);
 		}
-	}
-
-	@Override
-	public int getPageSize() {
-		int pageSize = -1;
-		for (InputGate gate : inputGates) {
-			if (pageSize == -1) {
-				pageSize = gate.getPageSize();
-			} else if (gate.getPageSize() != pageSize) {
-				throw new IllegalStateException("Found input gates with different page sizes.");
-			}
-		}
-		return pageSize;
 	}
 
 	@Override
@@ -301,8 +270,7 @@ public class UnionInputGate extends InputGate {
 
 			if (availableInputGates == 0) {
 				inputGatesWithData.notifyAll();
-				toNotify = isAvailable;
-				isAvailable = AVAILABLE;
+				toNotify = availabilityHelper.getUnavailableToResetAvailable();
 			}
 		}
 
@@ -317,7 +285,7 @@ public class UnionInputGate extends InputGate {
 				if (blocking) {
 					inputGatesWithData.wait();
 				} else {
-					resetIsAvailable();
+					availabilityHelper.resetUnavailable();
 					return Optional.empty();
 				}
 			}

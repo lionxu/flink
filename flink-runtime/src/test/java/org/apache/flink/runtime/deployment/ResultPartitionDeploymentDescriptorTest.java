@@ -27,6 +27,7 @@ import org.apache.flink.runtime.io.network.partition.ResultPartitionType;
 import org.apache.flink.runtime.jobgraph.IntermediateDataSetID;
 import org.apache.flink.runtime.jobgraph.IntermediateResultPartitionID;
 import org.apache.flink.runtime.shuffle.NettyShuffleDescriptor;
+import org.apache.flink.runtime.shuffle.NettyShuffleDescriptor.NetworkPartitionConnectionInfo;
 import org.apache.flink.runtime.shuffle.PartitionDescriptor;
 import org.apache.flink.runtime.shuffle.ShuffleDescriptor;
 import org.apache.flink.runtime.shuffle.UnknownShuffleDescriptor;
@@ -46,6 +47,7 @@ import static org.junit.Assert.assertThat;
  */
 public class ResultPartitionDeploymentDescriptorTest extends TestLogger {
 	private static final IntermediateDataSetID resultId = new IntermediateDataSetID();
+	private static final int numberOfPartitions = 5;
 
 	private static final IntermediateResultPartitionID partitionId = new IntermediateResultPartitionID();
 	private static final ExecutionAttemptID producerExecutionId = new ExecutionAttemptID();
@@ -56,6 +58,7 @@ public class ResultPartitionDeploymentDescriptorTest extends TestLogger {
 
 	private static final PartitionDescriptor partitionDescriptor = new PartitionDescriptor(
 		resultId,
+		numberOfPartitions,
 		partitionId,
 		partitionType,
 		numberOfSubpartitions,
@@ -71,13 +74,9 @@ public class ResultPartitionDeploymentDescriptorTest extends TestLogger {
 	 * Tests simple de/serialization with {@link UnknownShuffleDescriptor}.
 	 */
 	@Test
-	public void testSerializationWithUnknownShuffleDescriptor() throws Exception {
+	public void testSerializationOfUnknownShuffleDescriptor() throws IOException {
 		ShuffleDescriptor shuffleDescriptor = new UnknownShuffleDescriptor(resultPartitionID);
-
-		ResultPartitionDeploymentDescriptor copy =
-			createCopyAndVerifyResultPartitionDeploymentDescriptor(shuffleDescriptor);
-
-		ShuffleDescriptor shuffleDescriptorCopy = copy.getShuffleDescriptor();
+		ShuffleDescriptor shuffleDescriptorCopy = CommonTestUtils.createCopySerializable(shuffleDescriptor);
 		assertThat(shuffleDescriptorCopy, instanceOf(UnknownShuffleDescriptor.class));
 		assertThat(shuffleDescriptorCopy.getResultPartitionID(), is(resultPartitionID));
 		assertThat(shuffleDescriptorCopy.isUnknown(), is(true));
@@ -87,10 +86,10 @@ public class ResultPartitionDeploymentDescriptorTest extends TestLogger {
 	 * Tests simple de/serialization with {@link NettyShuffleDescriptor}.
 	 */
 	@Test
-	public void testSerializationWithNettyShuffleDescriptor() throws Exception {
+	public void testSerializationWithNettyShuffleDescriptor() throws IOException {
 		ShuffleDescriptor shuffleDescriptor = new NettyShuffleDescriptor(
 			producerLocation,
-			new NettyShuffleDescriptor.NetworkPartitionConnectionInfo(connectionID),
+			new NetworkPartitionConnectionInfo(connectionID),
 			resultPartitionID);
 
 		ResultPartitionDeploymentDescriptor copy =
@@ -102,24 +101,6 @@ public class ResultPartitionDeploymentDescriptorTest extends TestLogger {
 		assertThat(shuffleDescriptorCopy.isUnknown(), is(false));
 		assertThat(shuffleDescriptorCopy.isLocalTo(producerLocation), is(true));
 		assertThat(shuffleDescriptorCopy.getConnectionId(), is(connectionID));
-	}
-
-	@Test
-	public void testReleasedOnConsumptionFlag() {
-		for (ResultPartitionType partitionType : ResultPartitionType.values()) {
-			ResultPartitionDeploymentDescriptor partitionDescriptor = new ResultPartitionDeploymentDescriptor(
-				new PartitionDescriptor(resultId, partitionId, partitionType, numberOfSubpartitions, connectionIndex),
-				ResultPartitionID::new,
-				1,
-				true
-			);
-
-			if (partitionType == ResultPartitionType.BLOCKING) {
-				assertThat(partitionDescriptor.isReleasedOnConsumption(), is(false));
-			} else {
-				assertThat(partitionDescriptor.isReleasedOnConsumption(), is(true));
-			}
-		}
 	}
 
 	private static ResultPartitionDeploymentDescriptor createCopyAndVerifyResultPartitionDeploymentDescriptor(
@@ -136,6 +117,7 @@ public class ResultPartitionDeploymentDescriptorTest extends TestLogger {
 
 	private static void verifyResultPartitionDeploymentDescriptorCopy(ResultPartitionDeploymentDescriptor copy) {
 		assertThat(copy.getResultId(), is(resultId));
+		assertThat(copy.getTotalNumberOfPartitions(), is(numberOfPartitions));
 		assertThat(copy.getPartitionId(), is(partitionId));
 		assertThat(copy.getPartitionType(), is(partitionType));
 		assertThat(copy.getNumberOfSubpartitions(), is(numberOfSubpartitions));

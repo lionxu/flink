@@ -18,9 +18,20 @@
 
 package org.apache.flink.table.catalog.hive.util;
 
-import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.table.api.TableSchema;
+import org.apache.flink.table.api.constraints.UniqueConstraint;
+import org.apache.flink.table.catalog.hive.client.HiveShim;
+import org.apache.flink.table.expressions.CallExpression;
+import org.apache.flink.table.expressions.Expression;
+import org.apache.flink.table.expressions.ExpressionVisitor;
+import org.apache.flink.table.expressions.FieldReferenceExpression;
+import org.apache.flink.table.expressions.TypeLiteralExpression;
+import org.apache.flink.table.expressions.ValueLiteralExpression;
+import org.apache.flink.table.functions.BuiltInFunctionDefinitions;
+import org.apache.flink.table.functions.FunctionDefinition;
+import org.apache.flink.table.functions.hive.conversion.HiveInspectors;
 import org.apache.flink.table.types.DataType;
+import org.apache.flink.table.types.logical.LogicalTypeRoot;
 
 import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
@@ -29,24 +40,26 @@ import org.apache.hadoop.hive.metastore.api.SerDeInfo;
 import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
 import org.apache.hadoop.hive.serde.serdeConstants;
 import org.apache.hadoop.hive.serde2.SerDeUtils;
-import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
-import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
-import org.apache.hadoop.hive.serde2.typeinfo.PrimitiveTypeInfo;
-import org.apache.hadoop.hive.serde2.typeinfo.TypeInfo;
 import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoUtils;
 
-import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Properties;
+import java.util.Set;
 
-import static org.apache.flink.table.catalog.hive.HiveTableConfig.DEFAULT_LIST_COLUMN_TYPES_SEPARATOR;
+import static org.apache.flink.table.catalog.hive.HiveCatalogConfig.DEFAULT_LIST_COLUMN_TYPES_SEPARATOR;
 
 /**
  * Utils to for Hive-backed table.
  */
 public class HiveTableUtil {
+
+	private static final byte HIVE_CONSTRAINT_ENABLE = 1 << 2;
+	private static final byte HIVE_CONSTRAINT_VALIDATE = 1 << 1;
+	private static final byte HIVE_CONSTRAINT_RELY = 1;
 
 	private HiveTableUtil() {
 	}
@@ -54,7 +67,8 @@ public class HiveTableUtil {
 	/**
 	 * Create a Flink's TableSchema from Hive table's columns and partition keys.
 	 */
-	public static TableSchema createTableSchema(List<FieldSchema> cols, List<FieldSchema> partitionKeys) {
+	public static TableSchema createTableSchema(List<FieldSchema> cols, List<FieldSchema> partitionKeys,
+			Set<String> notNullColumns, UniqueConstraint primaryKey) {
 		List<FieldSchema> allCols = new ArrayList<>(cols);
 		allCols.addAll(partitionKeys);
 
@@ -66,11 +80,16 @@ public class HiveTableUtil {
 
 			colNames[i] = fs.getName();
 			colTypes[i] = HiveTypeUtil.toFlinkType(TypeInfoUtils.getTypeInfoFromTypeString(fs.getType()));
+			if (notNullColumns.contains(colNames[i])) {
+				colTypes[i] = colTypes[i].notNull();
+			}
 		}
 
-		return TableSchema.builder()
-				.fields(colNames, colTypes)
-				.build();
+		TableSchema.Builder builder = TableSchema.builder().fields(colNames, colTypes);
+		if (primaryKey != null) {
+			builder.primaryKey(primaryKey.getName(), primaryKey.getColumns().toArray(new String[0]));
+		}
+		return builder.build();
 	}
 
 	/**
@@ -84,7 +103,7 @@ public class HiveTableUtil {
 
 		for (int i = 0; i < fieldNames.length; i++) {
 			columns.add(
-				new FieldSchema(fieldNames[i], HiveTypeUtil.toHiveTypeName(fieldTypes[i]), null));
+				new FieldSchema(fieldNames[i], HiveTypeUtil.toHiveTypeInfo(fieldTypes[i], true).getTypeName(), null));
 		}
 
 		return columns;
@@ -139,24 +158,143 @@ public class HiveTableUtil {
 		return partition;
 	}
 
-	/**
-	 * Get Hive {@link ObjectInspector} for a Flink {@link TypeInformation}.
-	 */
-	public static ObjectInspector getObjectInspector(DataType flinkType) throws IOException {
-		return getObjectInspector(HiveTypeUtil.toHiveTypeInfo(flinkType));
+	// returns a constraint trait that requires ENABLE
+	public static byte enableConstraint(byte trait) {
+		return (byte) (trait | HIVE_CONSTRAINT_ENABLE);
 	}
 
-	// TODO: reuse Hive's TypeInfoUtils?
-	private static ObjectInspector getObjectInspector(TypeInfo type) throws IOException {
-		switch (type.getCategory()) {
+	// returns a constraint trait that requires VALIDATE
+	public static byte validateConstraint(byte trait) {
+		return (byte) (trait | HIVE_CONSTRAINT_VALIDATE);
+	}
 
-			case PRIMITIVE:
-				PrimitiveTypeInfo primitiveType = (PrimitiveTypeInfo) type;
-				return PrimitiveObjectInspectorFactory.getPrimitiveJavaObjectInspector(primitiveType);
+	// returns a constraint trait that requires RELY
+	public static byte relyConstraint(byte trait) {
+		return (byte) (trait | HIVE_CONSTRAINT_RELY);
+	}
 
-			// TODO: support complex types
-			default:
-				throw new IOException("Unsupported Hive type category " + type.getCategory());
+	// returns whether a trait requires ENABLE constraint
+	public static boolean requireEnableConstraint(byte trait) {
+		return (trait & HIVE_CONSTRAINT_ENABLE) != 0;
+	}
+
+	// returns whether a trait requires VALIDATE constraint
+	public static boolean requireValidateConstraint(byte trait) {
+		return (trait & HIVE_CONSTRAINT_VALIDATE) != 0;
+	}
+
+	// returns whether a trait requires RELY constraint
+	public static boolean requireRelyConstraint(byte trait) {
+		return (trait & HIVE_CONSTRAINT_RELY) != 0;
+	}
+
+	/**
+	 * Generates a filter string for partition columns from the given filter expressions.
+	 *
+	 * @param partColOffset The number of non-partition columns -- used to shift field reference index
+	 * @param partColNames The names of all partition columns
+	 * @param expressions  The filter expressions in CNF form
+	 * @return an Optional filter string equivalent to the expressions, which is empty if the expressions can't be handled
+	 */
+	public static Optional<String> makePartitionFilter(
+			int partColOffset, List<String> partColNames, List<Expression> expressions, HiveShim hiveShim) {
+		List<String> filters = new ArrayList<>(expressions.size());
+		ExpressionExtractor extractor = new ExpressionExtractor(partColOffset, partColNames, hiveShim);
+		for (Expression expression : expressions) {
+			String str = expression.accept(extractor);
+			if (str == null) {
+				return Optional.empty();
+			}
+			filters.add(str);
+		}
+		return Optional.of(String.join(" and ", filters));
+	}
+
+	private static class ExpressionExtractor implements ExpressionVisitor<String> {
+
+		// maps a supported function to its name
+		private static final Map<FunctionDefinition, String> FUNC_TO_STR = new HashMap<>();
+
+		static {
+			FUNC_TO_STR.put(BuiltInFunctionDefinitions.EQUALS, "=");
+			FUNC_TO_STR.put(BuiltInFunctionDefinitions.NOT_EQUALS, "<>");
+			FUNC_TO_STR.put(BuiltInFunctionDefinitions.GREATER_THAN, ">");
+			FUNC_TO_STR.put(BuiltInFunctionDefinitions.GREATER_THAN_OR_EQUAL, ">=");
+			FUNC_TO_STR.put(BuiltInFunctionDefinitions.LESS_THAN, "<");
+			FUNC_TO_STR.put(BuiltInFunctionDefinitions.LESS_THAN_OR_EQUAL, "<=");
+			FUNC_TO_STR.put(BuiltInFunctionDefinitions.AND, "and");
+			FUNC_TO_STR.put(BuiltInFunctionDefinitions.OR, "or");
+		}
+
+		// used to shift field reference index
+		private final int partColOffset;
+		private final List<String> partColNames;
+		private final HiveShim hiveShim;
+
+		ExpressionExtractor(int partColOffset, List<String> partColNames, HiveShim hiveShim) {
+			this.partColOffset = partColOffset;
+			this.partColNames = partColNames;
+			this.hiveShim = hiveShim;
+		}
+
+		@Override
+		public String visit(CallExpression call) {
+			FunctionDefinition funcDef = call.getFunctionDefinition();
+			if (FUNC_TO_STR.containsKey(funcDef)) {
+				List<String> operands = new ArrayList<>();
+				for (Expression child : call.getChildren()) {
+					String operand = child.accept(this);
+					if (operand == null) {
+						return null;
+					}
+					operands.add(operand);
+				}
+				return "(" + String.join(" " + FUNC_TO_STR.get(funcDef) + " ", operands) + ")";
+			}
+			return null;
+		}
+
+		@Override
+		public String visit(ValueLiteralExpression valueLiteral) {
+			DataType dataType = valueLiteral.getOutputDataType();
+			Object value = valueLiteral.getValueAs(Object.class).orElse(null);
+			if (value == null) {
+				return "null";
+			}
+			value = HiveInspectors.getConversion(HiveInspectors.getObjectInspector(dataType), dataType.getLogicalType(), hiveShim)
+					.toHiveObject(value);
+			String res = value.toString();
+			LogicalTypeRoot typeRoot = dataType.getLogicalType().getTypeRoot();
+			switch (typeRoot) {
+				case CHAR:
+				case VARCHAR:
+					res = "'" + res.replace("'", "''") + "'";
+					break;
+				case DATE:
+				case TIMESTAMP_WITHOUT_TIME_ZONE:
+				case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
+					// hive not support partition filter push down with these types.
+					return null;
+				default:
+					break;
+			}
+			return res;
+		}
+
+		@Override
+		public String visit(FieldReferenceExpression fieldReference) {
+			return partColNames.get(fieldReference.getFieldIndex() - partColOffset);
+		}
+
+		@Override
+		public String visit(TypeLiteralExpression typeLiteral) {
+			return typeLiteral.getOutputDataType().toString();
+		}
+
+		@Override
+		public String visit(Expression other) {
+			// only support resolved expressions
+			return null;
 		}
 	}
 

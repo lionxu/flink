@@ -22,6 +22,7 @@ import org.apache.flink.runtime.executiongraph.IntermediateResultPartition;
 import org.apache.flink.runtime.io.network.api.writer.ResultPartitionWriter;
 import org.apache.flink.runtime.io.network.buffer.Buffer;
 import org.apache.flink.runtime.io.network.buffer.BufferBuilder;
+import org.apache.flink.runtime.io.network.buffer.BufferCompressor;
 import org.apache.flink.runtime.io.network.buffer.BufferConsumer;
 import org.apache.flink.runtime.io.network.buffer.BufferPool;
 import org.apache.flink.runtime.io.network.buffer.BufferPoolOwner;
@@ -37,6 +38,7 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.Nullable;
 
 import java.io.IOException;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.apache.flink.util.Preconditions.checkArgument;
@@ -98,6 +100,10 @@ public class ResultPartition implements ResultPartitionWriter, BufferPoolOwner {
 
 	private final FunctionWithException<BufferPoolOwner, BufferPool, IOException> bufferPoolFactory;
 
+	/** Used to compress buffer to reduce IO. */
+	@Nullable
+	protected final BufferCompressor bufferCompressor;
+
 	public ResultPartition(
 		String owningTaskName,
 		ResultPartitionID partitionId,
@@ -105,6 +111,7 @@ public class ResultPartition implements ResultPartitionWriter, BufferPoolOwner {
 		ResultSubpartition[] subpartitions,
 		int numTargetKeyGroups,
 		ResultPartitionManager partitionManager,
+		@Nullable BufferCompressor bufferCompressor,
 		FunctionWithException<BufferPoolOwner, BufferPool, IOException> bufferPoolFactory) {
 
 		this.owningTaskName = checkNotNull(owningTaskName);
@@ -113,6 +120,7 @@ public class ResultPartition implements ResultPartitionWriter, BufferPoolOwner {
 		this.subpartitions = checkNotNull(subpartitions);
 		this.numTargetKeyGroups = numTargetKeyGroups;
 		this.partitionManager = checkNotNull(partitionManager);
+		this.bufferCompressor = bufferCompressor;
 		this.bufferPoolFactory = bufferPoolFactory;
 	}
 
@@ -274,6 +282,7 @@ public class ResultPartition implements ResultPartitionWriter, BufferPoolOwner {
 	 */
 	public ResultSubpartitionView createSubpartitionView(int index, BufferAvailabilityListener availabilityListener) throws IOException {
 		checkElementIndex(index, subpartitions.length, "Subpartition not found.");
+		checkState(!isReleased.get(), "Partition released.");
 
 		ResultSubpartitionView readView = subpartitions[index].createReadView(availabilityListener);
 
@@ -322,18 +331,17 @@ public class ResultPartition implements ResultPartitionWriter, BufferPoolOwner {
 	}
 
 	@Override
+	public CompletableFuture<?> getAvailableFuture() {
+		return bufferPool.getAvailableFuture();
+	}
+
+	@Override
 	public String toString() {
 		return "ResultPartition " + partitionId.toString() + " [" + partitionType + ", "
 				+ subpartitions.length + " subpartitions]";
 	}
 
 	// ------------------------------------------------------------------------
-
-	/**
-	 * Pins the result partition.
-	 */
-	void pin() {
-	}
 
 	/**
 	 * Notification when a subpartition is released.

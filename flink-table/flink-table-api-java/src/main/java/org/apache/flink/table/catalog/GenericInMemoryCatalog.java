@@ -32,6 +32,8 @@ import org.apache.flink.table.catalog.exceptions.TableNotExistException;
 import org.apache.flink.table.catalog.exceptions.TableNotPartitionedException;
 import org.apache.flink.table.catalog.stats.CatalogColumnStatistics;
 import org.apache.flink.table.catalog.stats.CatalogTableStatistics;
+import org.apache.flink.table.expressions.Expression;
+import org.apache.flink.table.functions.FunctionIdentifier;
 import org.apache.flink.util.StringUtils;
 
 import java.util.ArrayList;
@@ -48,8 +50,6 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
  * A generic catalog implementation that holds all meta objects in memory.
  */
 public class GenericInMemoryCatalog extends AbstractCatalog {
-	public static final String FLINK_IS_GENERIC_KEY = "is_generic";
-	public static final String FLINK_IS_GENERIC_VALUE = "true";
 
 	public static final String DEFAULT_DB = "default";
 
@@ -71,7 +71,7 @@ public class GenericInMemoryCatalog extends AbstractCatalog {
 		super(name, defaultDatabase);
 
 		this.databases = new LinkedHashMap<>();
-		this.databases.put(defaultDatabase, new GenericCatalogDatabase(new HashMap<>(), ""));
+		this.databases.put(defaultDatabase, new CatalogDatabaseImpl(new HashMap<>(), null));
 		this.tables = new LinkedHashMap<>();
 		this.functions = new LinkedHashMap<>();
 		this.partitions = new LinkedHashMap<>();
@@ -108,7 +108,7 @@ public class GenericInMemoryCatalog extends AbstractCatalog {
 	}
 
 	@Override
-	public void dropDatabase(String databaseName, boolean ignoreIfNotExists)
+	public void dropDatabase(String databaseName, boolean ignoreIfNotExists, boolean cascade)
 			throws DatabaseNotExistException, DatabaseNotEmptyException {
 		checkArgument(!StringUtils.isNullOrWhitespaceOnly(databaseName));
 
@@ -116,6 +116,27 @@ public class GenericInMemoryCatalog extends AbstractCatalog {
 
 			// Make sure the database is empty
 			if (isDatabaseEmpty(databaseName)) {
+				databases.remove(databaseName);
+			} else if (cascade) {
+				// delete all tables and functions in this database and then delete the database.
+				List<ObjectPath> deleteTablePaths = tables.keySet().stream()
+						.filter(op -> op.getDatabaseName().equals(databaseName)).collect(Collectors.toList());
+				deleteTablePaths.forEach(objectPath -> {
+						try {
+							dropTable(objectPath, true);
+						} catch (TableNotExistException e) {
+							//ignore
+						}
+					});
+				List<ObjectPath> deleteFunctionPaths = functions.keySet().stream()
+						.filter(op -> op.getDatabaseName().equals(databaseName)).collect(Collectors.toList());
+				deleteFunctionPaths.forEach(objectPath -> {
+						try {
+							dropFunction(objectPath, true);
+						} catch (FunctionNotExistException e) {
+							//ignore
+						}
+					});
 				databases.remove(databaseName);
 			} else {
 				throw new DatabaseNotEmptyException(getName(), databaseName);
@@ -342,10 +363,12 @@ public class GenericInMemoryCatalog extends AbstractCatalog {
 	// ------ functions ------
 
 	@Override
-	public void createFunction(ObjectPath functionPath, CatalogFunction function, boolean ignoreIfExists)
+	public void createFunction(ObjectPath path, CatalogFunction function, boolean ignoreIfExists)
 			throws FunctionAlreadyExistException, DatabaseNotExistException {
-		checkNotNull(functionPath);
+		checkNotNull(path);
 		checkNotNull(function);
+
+		ObjectPath functionPath = normalize(path);
 
 		if (!databaseExists(functionPath.getDatabaseName())) {
 			throw new DatabaseNotExistException(getName(), functionPath.getDatabaseName());
@@ -361,10 +384,12 @@ public class GenericInMemoryCatalog extends AbstractCatalog {
 	}
 
 	@Override
-	public void alterFunction(ObjectPath functionPath, CatalogFunction newFunction, boolean ignoreIfNotExists)
+	public void alterFunction(ObjectPath path, CatalogFunction newFunction, boolean ignoreIfNotExists)
 			throws FunctionNotExistException {
-		checkNotNull(functionPath);
+		checkNotNull(path);
 		checkNotNull(newFunction);
+
+		ObjectPath functionPath = normalize(path);
 
 		CatalogFunction existingFunction = functions.get(functionPath);
 
@@ -383,8 +408,10 @@ public class GenericInMemoryCatalog extends AbstractCatalog {
 	}
 
 	@Override
-	public void dropFunction(ObjectPath functionPath, boolean ignoreIfNotExists) throws FunctionNotExistException {
-		checkNotNull(functionPath);
+	public void dropFunction(ObjectPath path, boolean ignoreIfNotExists) throws FunctionNotExistException {
+		checkNotNull(path);
+
+		ObjectPath functionPath = normalize(path);
 
 		if (functionExists(functionPath)) {
 			functions.remove(functionPath);
@@ -402,13 +429,16 @@ public class GenericInMemoryCatalog extends AbstractCatalog {
 		}
 
 		return functions.keySet().stream()
-			.filter(k -> k.getDatabaseName().equals(databaseName)).map(k -> k.getObjectName())
+			.filter(k -> k.getDatabaseName().equals(databaseName))
+			.map(k -> k.getObjectName())
 			.collect(Collectors.toList());
 	}
 
 	@Override
-	public CatalogFunction getFunction(ObjectPath functionPath) throws FunctionNotExistException {
-		checkNotNull(functionPath);
+	public CatalogFunction getFunction(ObjectPath path) throws FunctionNotExistException {
+		checkNotNull(path);
+
+		ObjectPath functionPath = normalize(path);
 
 		if (!functionExists(functionPath)) {
 			throw new FunctionNotExistException(getName(), functionPath);
@@ -418,9 +448,16 @@ public class GenericInMemoryCatalog extends AbstractCatalog {
 	}
 
 	@Override
-	public boolean functionExists(ObjectPath functionPath) {
-		checkNotNull(functionPath);
+	public boolean functionExists(ObjectPath path) {
+		checkNotNull(path);
+
+		ObjectPath functionPath = normalize(path);
+
 		return databaseExists(functionPath.getDatabaseName()) && functions.containsKey(functionPath);
+	}
+
+	private ObjectPath normalize(ObjectPath path) {
+		return new ObjectPath(path.getDatabaseName(), FunctionIdentifier.normalizeName(path.getObjectName()));
 	}
 
 	// ------ partitions ------
@@ -515,6 +552,12 @@ public class GenericInMemoryCatalog extends AbstractCatalog {
 	}
 
 	@Override
+	public List<CatalogPartitionSpec> listPartitionsByFilter(ObjectPath tablePath, List<Expression> filters)
+			throws TableNotExistException, TableNotPartitionedException, CatalogException {
+		throw new UnsupportedOperationException();
+	}
+
+	@Override
 	public CatalogPartition getPartition(ObjectPath tablePath, CatalogPartitionSpec partitionSpec)
 			throws PartitionNotExistException, CatalogException {
 		checkNotNull(tablePath);
@@ -592,9 +635,12 @@ public class GenericInMemoryCatalog extends AbstractCatalog {
 		if (!tableExists(tablePath)) {
 			throw new TableNotExistException(getName(), tablePath);
 		}
-
-		CatalogTableStatistics result = tableStats.get(tablePath);
-		return result != null ? result.copy() : CatalogTableStatistics.UNKNOWN;
+		if (!isPartitionedTable(tablePath)) {
+			CatalogTableStatistics result = tableStats.get(tablePath);
+			return result != null ? result.copy() : CatalogTableStatistics.UNKNOWN;
+		} else {
+			return CatalogTableStatistics.UNKNOWN;
+		}
 	}
 
 	@Override

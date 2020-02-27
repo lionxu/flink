@@ -19,7 +19,7 @@
 package org.apache.flink.runtime.io.network.partition.consumer;
 
 import org.apache.flink.runtime.event.TaskEvent;
-import org.apache.flink.runtime.io.AsyncDataInput;
+import org.apache.flink.runtime.io.PullingAsyncDataInput;
 
 import java.io.IOException;
 import java.util.Optional;
@@ -69,18 +69,18 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
  * will have an input gate attached to it. This will provide its input, which will consist of one
  * subpartition from each partition of the intermediate result.
  */
-public abstract class InputGate implements AsyncDataInput<BufferOrEvent>, AutoCloseable {
+public abstract class InputGate implements PullingAsyncDataInput<BufferOrEvent>, AutoCloseable {
 
-	protected CompletableFuture<?> isAvailable = new CompletableFuture<>();
+	protected final AvailabilityHelper availabilityHelper = new AvailabilityHelper();
 
 	public abstract int getNumberOfInputChannels();
 
 	public abstract boolean isFinished();
 
-	public abstract void requestPartitions() throws IOException, InterruptedException;
-
 	/**
 	 * Blocking call waiting for next {@link BufferOrEvent}.
+	 *
+	 * <p>Note: It should be guaranteed that the previous returned buffer has been recycled before getting next one.
 	 *
 	 * @return {@code Optional.empty()} if {@link #isFinished()} returns true.
 	 */
@@ -89,13 +89,13 @@ public abstract class InputGate implements AsyncDataInput<BufferOrEvent>, AutoCl
 	/**
 	 * Poll the {@link BufferOrEvent}.
 	 *
+	 * <p>Note: It should be guaranteed that the previous returned buffer has been recycled before polling next one.
+	 *
 	 * @return {@code Optional.empty()} if there is no data to return or if {@link #isFinished()} returns true.
 	 */
 	public abstract Optional<BufferOrEvent> pollNext() throws IOException, InterruptedException;
 
 	public abstract void sendTaskEvent(TaskEvent event) throws IOException;
-
-	public abstract int getPageSize();
 
 	/**
 	 * @return a future that is completed if there are more records available. If there are more
@@ -103,15 +103,8 @@ public abstract class InputGate implements AsyncDataInput<BufferOrEvent>, AutoCl
 	 * not completed futures should become completed once there are more records available.
 	 */
 	@Override
-	public CompletableFuture<?> isAvailable() {
-		return isAvailable;
-	}
-
-	protected void resetIsAvailable() {
-		// try to avoid volatile access in isDone()}
-		if (isAvailable == AVAILABLE || isAvailable.isDone()) {
-			isAvailable = new CompletableFuture<>();
-		}
+	public CompletableFuture<?> getAvailableFuture() {
+		return availabilityHelper.getAvailableFuture();
 	}
 
 	/**
@@ -132,5 +125,5 @@ public abstract class InputGate implements AsyncDataInput<BufferOrEvent>, AutoCl
 	/**
 	 * Setup gate, potentially heavy-weight, blocking operation comparing to just creation.
 	 */
-	public abstract void setup() throws IOException;
+	public abstract void setup() throws IOException, InterruptedException;
 }

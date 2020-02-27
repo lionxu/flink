@@ -19,22 +19,27 @@
 package org.apache.flink.table.catalog.hive;
 
 import org.apache.flink.annotation.VisibleForTesting;
+import org.apache.flink.api.java.hadoop.mapred.utils.HadoopUtils;
+import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.connectors.hive.HiveTableFactory;
 import org.apache.flink.table.api.TableSchema;
+import org.apache.flink.table.api.constraints.UniqueConstraint;
 import org.apache.flink.table.catalog.AbstractCatalog;
-import org.apache.flink.table.catalog.AbstractCatalogTable;
-import org.apache.flink.table.catalog.AbstractCatalogView;
 import org.apache.flink.table.catalog.CatalogBaseTable;
 import org.apache.flink.table.catalog.CatalogDatabase;
+import org.apache.flink.table.catalog.CatalogDatabaseImpl;
 import org.apache.flink.table.catalog.CatalogFunction;
+import org.apache.flink.table.catalog.CatalogFunctionImpl;
 import org.apache.flink.table.catalog.CatalogPartition;
+import org.apache.flink.table.catalog.CatalogPartitionImpl;
 import org.apache.flink.table.catalog.CatalogPartitionSpec;
-import org.apache.flink.table.catalog.GenericCatalogDatabase;
-import org.apache.flink.table.catalog.GenericCatalogFunction;
-import org.apache.flink.table.catalog.GenericCatalogPartition;
-import org.apache.flink.table.catalog.GenericCatalogTable;
-import org.apache.flink.table.catalog.GenericCatalogView;
-import org.apache.flink.table.catalog.GenericInMemoryCatalog;
+import org.apache.flink.table.catalog.CatalogTable;
+import org.apache.flink.table.catalog.CatalogTableImpl;
+import org.apache.flink.table.catalog.CatalogView;
+import org.apache.flink.table.catalog.CatalogViewImpl;
+import org.apache.flink.table.catalog.FunctionLanguage;
 import org.apache.flink.table.catalog.ObjectPath;
+import org.apache.flink.table.catalog.config.CatalogConfig;
 import org.apache.flink.table.catalog.exceptions.CatalogException;
 import org.apache.flink.table.catalog.exceptions.DatabaseAlreadyExistException;
 import org.apache.flink.table.catalog.exceptions.DatabaseNotEmptyException;
@@ -47,17 +52,29 @@ import org.apache.flink.table.catalog.exceptions.PartitionSpecInvalidException;
 import org.apache.flink.table.catalog.exceptions.TableAlreadyExistException;
 import org.apache.flink.table.catalog.exceptions.TableNotExistException;
 import org.apache.flink.table.catalog.exceptions.TableNotPartitionedException;
+import org.apache.flink.table.catalog.exceptions.TablePartitionedException;
 import org.apache.flink.table.catalog.hive.client.HiveMetastoreClientFactory;
 import org.apache.flink.table.catalog.hive.client.HiveMetastoreClientWrapper;
+import org.apache.flink.table.catalog.hive.client.HiveShim;
+import org.apache.flink.table.catalog.hive.client.HiveShimLoader;
+import org.apache.flink.table.catalog.hive.descriptors.HiveCatalogValidator;
+import org.apache.flink.table.catalog.hive.factories.HiveFunctionDefinitionFactory;
+import org.apache.flink.table.catalog.hive.util.HiveReflectionUtils;
+import org.apache.flink.table.catalog.hive.util.HiveStatsUtil;
 import org.apache.flink.table.catalog.hive.util.HiveTableUtil;
 import org.apache.flink.table.catalog.stats.CatalogColumnStatistics;
 import org.apache.flink.table.catalog.stats.CatalogTableStatistics;
+import org.apache.flink.table.descriptors.DescriptorProperties;
+import org.apache.flink.table.expressions.Expression;
+import org.apache.flink.table.factories.FunctionDefinitionFactory;
+import org.apache.flink.table.factories.TableFactory;
 import org.apache.flink.util.StringUtils;
 
+import org.apache.hadoop.hive.common.StatsSetupConst;
 import org.apache.hadoop.hive.conf.HiveConf;
-import org.apache.hadoop.hive.metastore.MetaStoreUtils;
 import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.hadoop.hive.metastore.api.AlreadyExistsException;
+import org.apache.hadoop.hive.metastore.api.ColumnStatisticsObj;
 import org.apache.hadoop.hive.metastore.api.Database;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.hadoop.hive.metastore.api.Function;
@@ -70,6 +87,7 @@ import org.apache.hadoop.hive.metastore.api.PrincipalType;
 import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
 import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.hadoop.hive.metastore.api.UnknownDBException;
+import org.apache.hadoop.hive.metastore.partition.spec.PartitionSpecProxy;
 import org.apache.hadoop.hive.ql.io.StorageFormatDescriptor;
 import org.apache.hadoop.hive.ql.io.StorageFormatFactory;
 import org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe;
@@ -79,13 +97,20 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
-import java.net.URL;
+import java.net.MalformedURLException;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
 
+import static org.apache.flink.table.catalog.config.CatalogConfig.FLINK_PROPERTY_PREFIX;
+import static org.apache.flink.table.catalog.hive.util.HiveStatsUtil.parsePositiveIntStat;
+import static org.apache.flink.table.catalog.hive.util.HiveStatsUtil.parsePositiveLongStat;
+import static org.apache.flink.table.filesystem.PartitionPathUtils.unescapePathName;
 import static org.apache.flink.util.Preconditions.checkArgument;
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
@@ -100,11 +125,6 @@ public class HiveCatalog extends AbstractCatalog {
 	private static final StorageFormatFactory storageFormatFactory = new StorageFormatFactory();
 	private static final String DEFAULT_HIVE_TABLE_STORAGE_FORMAT = "TextFile";
 
-	// Prefix used to distinguish properties created by Hive and Flink,
-	// as Hive metastore has its own properties created upon table creation and migration between different versions of metastore.
-	private static final String FLINK_PROPERTY_PREFIX = "flink.";
-	private static final String FLINK_PROPERTY_IS_GENERIC = FLINK_PROPERTY_PREFIX + GenericInMemoryCatalog.FLINK_IS_GENERIC_KEY;
-
 	// Prefix used to distinguish Flink functions from Hive functions.
 	// It's appended to Flink function's class name
 	// because Hive's Function object doesn't have properties or other place to store the flag for Flink functions.
@@ -112,33 +132,51 @@ public class HiveCatalog extends AbstractCatalog {
 
 	private final HiveConf hiveConf;
 	private final String hiveVersion;
+	private final HiveShim hiveShim;
 
 	private HiveMetastoreClientWrapper client;
 
-	public HiveCatalog(String catalogName, @Nullable String defaultDatabase, @Nullable URL hiveSiteUrl, String hiveVersion) {
+	public HiveCatalog(String catalogName, @Nullable String defaultDatabase, @Nullable String hiveConfDir, String hiveVersion) {
 		this(catalogName,
 			defaultDatabase == null ? DEFAULT_DB : defaultDatabase,
-			createHiveConf(hiveSiteUrl),
+			createHiveConf(hiveConfDir),
 			hiveVersion);
 	}
 
 	@VisibleForTesting
-	protected HiveCatalog(String catalogName, String defaultDatabase, HiveConf hiveConf, String hiveVersion) {
+	protected HiveCatalog(String catalogName, String defaultDatabase, @Nullable HiveConf hiveConf, String hiveVersion) {
 		super(catalogName, defaultDatabase == null ? DEFAULT_DB : defaultDatabase);
 
 		this.hiveConf = hiveConf == null ? createHiveConf(null) : hiveConf;
 		checkArgument(!StringUtils.isNullOrWhitespaceOnly(hiveVersion), "hiveVersion cannot be null or empty");
 		this.hiveVersion = hiveVersion;
+		hiveShim = HiveShimLoader.loadHiveShim(hiveVersion);
+		// add this to hiveConf to make sure table factory and source/sink see the same Hive version as HiveCatalog
+		this.hiveConf.set(HiveCatalogValidator.CATALOG_HIVE_VERSION, hiveVersion);
 
 		LOG.info("Created HiveCatalog '{}'", catalogName);
 	}
 
-	private static HiveConf createHiveConf(URL hiveSiteUrl) {
-		LOG.info("Setting hive-site location as {}", hiveSiteUrl);
+	private static HiveConf createHiveConf(@Nullable String hiveConfDir) {
+		LOG.info("Setting hive conf dir as {}", hiveConfDir);
 
-		HiveConf.setHiveSiteLocation(hiveSiteUrl);
+		try {
+			HiveConf.setHiveSiteLocation(
+				hiveConfDir == null ?
+					null : Paths.get(hiveConfDir, "hive-site.xml").toUri().toURL());
+		} catch (MalformedURLException e) {
+			throw new CatalogException(
+				String.format("Failed to get hive-site.xml from %s", hiveConfDir), e);
+		}
 
-		return new HiveConf();
+		// create HiveConf from hadoop configuration
+		return new HiveConf(HadoopUtils.getHadoopConfiguration(new org.apache.flink.configuration.Configuration()),
+			HiveConf.class);
+	}
+
+	@VisibleForTesting
+	public HiveConf getHiveConf() {
+		return hiveConf;
 	}
 
 	@VisibleForTesting
@@ -168,6 +206,16 @@ public class HiveCatalog extends AbstractCatalog {
 		}
 	}
 
+	@Override
+	public Optional<TableFactory> getTableFactory() {
+		return Optional.of(new HiveTableFactory(hiveConf));
+	}
+
+	@Override
+	public Optional<FunctionDefinitionFactory> getFunctionDefinitionFactory() {
+		return Optional.of(new HiveFunctionDefinitionFactory(hiveShim));
+	}
+
 	// ------ databases ------
 
 	@Override
@@ -175,9 +223,10 @@ public class HiveCatalog extends AbstractCatalog {
 		Database hiveDatabase = getHiveDatabase(databaseName);
 
 		Map<String, String> properties = hiveDatabase.getParameters();
-		boolean isGeneric = Boolean.valueOf(properties.get(FLINK_PROPERTY_IS_GENERIC));
-		return !isGeneric ? new HiveCatalogDatabase(properties, hiveDatabase.getLocationUri(), hiveDatabase.getDescription()) :
-			new GenericCatalogDatabase(retrieveFlinkProperties(properties), hiveDatabase.getDescription());
+
+		properties.put(HiveCatalogConfig.DATABASE_LOCATION_URI, hiveDatabase.getLocationUri());
+
+		return new CatalogDatabaseImpl(properties, hiveDatabase.getDescription());
 	}
 
 	@Override
@@ -200,25 +249,17 @@ public class HiveCatalog extends AbstractCatalog {
 	}
 
 	private static Database instantiateHiveDatabase(String databaseName, CatalogDatabase database) {
-		if (database instanceof HiveCatalogDatabase) {
-			HiveCatalogDatabase db = (HiveCatalogDatabase) database;
-			return new Database(
-				databaseName,
-				db.getComment(),
-				db.getLocation(),
-				db.getProperties());
-		} else if (database instanceof GenericCatalogDatabase) {
-			GenericCatalogDatabase db = (GenericCatalogDatabase) database;
 
-			return new Database(
-				databaseName,
-				db.getComment(),
-				// HDFS location URI which GenericCatalogDatabase shouldn't care
-				null,
-				maskFlinkProperties(db.getProperties()));
-		} else {
-			throw new CatalogException(String.format("Unsupported catalog database type %s", database.getClass()), null);
-		}
+		Map<String, String> properties = database.getProperties();
+
+		String dbLocationUri = properties.remove(HiveCatalogConfig.DATABASE_LOCATION_URI);
+
+		return new Database(
+			databaseName,
+			database.getComment(),
+			dbLocationUri,
+			properties
+		);
 	}
 
 	@Override
@@ -227,21 +268,13 @@ public class HiveCatalog extends AbstractCatalog {
 		checkArgument(!StringUtils.isNullOrWhitespaceOnly(databaseName), "databaseName cannot be null or empty");
 		checkNotNull(newDatabase, "newDatabase cannot be null");
 
-		CatalogDatabase existingDatabase;
-		try {
-			existingDatabase = getDatabase(databaseName);
-		} catch (DatabaseNotExistException e) {
+		// client.alterDatabase doesn't throw any exception if there is no existing database
+		if (!databaseExists(databaseName)) {
 			if (!ignoreIfNotExists) {
-				throw e;
+				throw new DatabaseNotExistException(getName(), databaseName);
 			}
-			return;
-		}
 
-		if (existingDatabase.getClass() != newDatabase.getClass()) {
-			throw new CatalogException(
-				String.format("Database types don't match. Existing database is '%s' and new database is '%s'.",
-					existingDatabase.getClass().getName(), newDatabase.getClass().getName())
-			);
+			return;
 		}
 
 		Database newHiveDatabase = instantiateHiveDatabase(databaseName, newDatabase);
@@ -276,10 +309,10 @@ public class HiveCatalog extends AbstractCatalog {
 	}
 
 	@Override
-	public void dropDatabase(String name, boolean ignoreIfNotExists) throws DatabaseNotExistException,
-			DatabaseNotEmptyException, CatalogException {
+	public void dropDatabase(String name, boolean ignoreIfNotExists, boolean cascade)
+			throws DatabaseNotExistException, DatabaseNotEmptyException, CatalogException {
 		try {
-			client.dropDatabase(name, true, ignoreIfNotExists);
+			client.dropDatabase(name, true, ignoreIfNotExists, cascade);
 		} catch (NoSuchObjectException e) {
 			if (!ignoreIfNotExists) {
 				throw new DatabaseNotExistException(getName(), name);
@@ -309,7 +342,7 @@ public class HiveCatalog extends AbstractCatalog {
 		checkNotNull(tablePath, "tablePath cannot be null");
 
 		Table hiveTable = getHiveTable(tablePath);
-		return instantiateHiveCatalogTable(hiveTable);
+		return instantiateCatalogTable(hiveTable, hiveConf);
 	}
 
 	@Override
@@ -328,7 +361,7 @@ public class HiveCatalog extends AbstractCatalog {
 			client.createTable(hiveTable);
 		} catch (AlreadyExistsException e) {
 			if (!ignoreIfExists) {
-				throw new TableAlreadyExistException(getName(), tablePath);
+				throw new TableAlreadyExistException(getName(), tablePath, e);
 			}
 		} catch (TException e) {
 			throw new CatalogException(String.format("Failed to create table %s", tablePath.getFullName()), e);
@@ -380,7 +413,7 @@ public class HiveCatalog extends AbstractCatalog {
 			return;
 		}
 
-		CatalogBaseTable existingTable = instantiateHiveCatalogTable(hiveTable);
+		CatalogBaseTable existingTable = instantiateCatalogTable(hiveTable, hiveConf);
 
 		if (existingTable.getClass() != newCatalogTable.getClass()) {
 			throw new CatalogException(
@@ -479,55 +512,79 @@ public class HiveCatalog extends AbstractCatalog {
 		}
 	}
 
-	private static CatalogBaseTable instantiateHiveCatalogTable(Table hiveTable) {
+	private CatalogBaseTable instantiateCatalogTable(Table hiveTable, HiveConf hiveConf) {
 		boolean isView = TableType.valueOf(hiveTable.getTableType()) == TableType.VIRTUAL_VIEW;
 
 		// Table properties
 		Map<String, String> properties = hiveTable.getParameters();
-		boolean isGeneric = Boolean.valueOf(properties.get(FLINK_PROPERTY_IS_GENERIC));
-		if (isGeneric) {
-			properties = retrieveFlinkProperties(properties);
-		}
-		String comment = properties.remove(HiveTableConfig.TABLE_COMMENT);
 
-		// Table schema
-		TableSchema tableSchema =
-			HiveTableUtil.createTableSchema(hiveTable.getSd().getCols(), hiveTable.getPartitionKeys());
+		// When retrieving a table, a generic table needs explicitly have a key is_generic = true
+		// otherwise, this is a Hive table if 1) the key is missing 2) is_generic = false
+		// this is opposite to creating a table. See instantiateHiveTable()
+		boolean isGeneric = Boolean.parseBoolean(hiveTable.getParameters().getOrDefault(CatalogConfig.IS_GENERIC, "false"));
 
+		TableSchema tableSchema;
 		// Partition keys
 		List<String> partitionKeys = new ArrayList<>();
-		if (!hiveTable.getPartitionKeys().isEmpty()) {
-			partitionKeys = getFieldNames(hiveTable.getPartitionKeys());
+
+		if (isGeneric) {
+			properties = retrieveFlinkProperties(properties);
+			DescriptorProperties tableSchemaProps = new DescriptorProperties(true);
+			tableSchemaProps.putProperties(properties);
+			ObjectPath tablePath = new ObjectPath(hiveTable.getDbName(), hiveTable.getTableName());
+			tableSchema = tableSchemaProps.getOptionalTableSchema(HiveCatalogConfig.GENERIC_TABLE_SCHEMA_PREFIX)
+					.orElseThrow(() -> new CatalogException("Failed to get table schema from properties for generic table " + tablePath));
+			// remove the schema from properties
+			properties = properties.entrySet().stream()
+					.filter(e -> !e.getKey().startsWith(HiveCatalogConfig.GENERIC_TABLE_SCHEMA_PREFIX))
+					.collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+		} else {
+			properties.put(CatalogConfig.IS_GENERIC, String.valueOf(false));
+			// Table schema
+			List<FieldSchema> fields = getNonPartitionFields(hiveConf, hiveTable);
+			Set<String> notNullColumns = client.getNotNullColumns(hiveConf, hiveTable.getDbName(), hiveTable.getTableName());
+			Optional<UniqueConstraint> primaryKey = isView ? Optional.empty() :
+					client.getPrimaryKey(hiveTable.getDbName(), hiveTable.getTableName(), HiveTableUtil.relyConstraint((byte) 0));
+			// PK columns cannot be null
+			primaryKey.ifPresent(pk -> notNullColumns.addAll(pk.getColumns()));
+			tableSchema = HiveTableUtil.createTableSchema(fields, hiveTable.getPartitionKeys(), notNullColumns, primaryKey.orElse(null));
+
+			if (!hiveTable.getPartitionKeys().isEmpty()) {
+				partitionKeys = getFieldNames(hiveTable.getPartitionKeys());
+			}
 		}
 
+		String comment = properties.remove(HiveCatalogConfig.COMMENT);
+
 		if (isView) {
-			if (isGeneric) {
-				return new GenericCatalogView(
+			return new CatalogViewImpl(
 					hiveTable.getViewOriginalText(),
 					hiveTable.getViewExpandedText(),
 					tableSchema,
 					properties,
-					comment
-				);
-			} else {
-				return new HiveCatalogView(
-					hiveTable.getViewOriginalText(),
-					hiveTable.getViewExpandedText(),
-					tableSchema,
-					properties,
-					comment
-				);
-			}
+					comment);
 		} else {
-			if (isGeneric) {
-				return new GenericCatalogTable(tableSchema, partitionKeys, properties, comment);
-			} else {
-				return new HiveCatalogTable(tableSchema, partitionKeys, properties, comment);
-			}
+			return new CatalogTableImpl(tableSchema, partitionKeys, properties, comment);
 		}
 	}
 
-	private  static Table instantiateHiveTable(ObjectPath tablePath, CatalogBaseTable table) {
+	private List<FieldSchema> getNonPartitionFields(HiveConf hiveConf, Table hiveTable) {
+		if (org.apache.hadoop.hive.ql.metadata.Table.hasMetastoreBasedSchema(hiveConf,
+				hiveTable.getSd().getSerdeInfo().getSerializationLib())) {
+			// get schema from metastore
+			return hiveTable.getSd().getCols();
+		} else {
+			// get schema from deserializer
+			return hiveShim.getFieldsFromDeserializer(hiveConf, hiveTable, true);
+		}
+	}
+
+	@VisibleForTesting
+	protected static Table instantiateHiveTable(ObjectPath tablePath, CatalogBaseTable table) {
+		if (!(table instanceof CatalogTableImpl) && !(table instanceof CatalogViewImpl)) {
+			throw new CatalogException(
+					"HiveCatalog only supports CatalogTableImpl and CatalogViewImpl");
+		}
 		// let Hive set default parameters for us, e.g. serialization.format
 		Table hiveTable = org.apache.hadoop.hive.ql.metadata.Table.getEmptyTable(tablePath.getDatabaseName(),
 			tablePath.getObjectName());
@@ -535,48 +592,73 @@ public class HiveCatalog extends AbstractCatalog {
 
 		Map<String, String> properties = new HashMap<>(table.getProperties());
 		// Table comment
-		properties.put(HiveTableConfig.TABLE_COMMENT, table.getComment());
-		if (table instanceof GenericCatalogTable || table instanceof GenericCatalogView) {
-			properties = maskFlinkProperties(properties);
+		if (table.getComment() != null) {
+			properties.put(HiveCatalogConfig.COMMENT, table.getComment());
 		}
-		// Table properties
-		hiveTable.setParameters(properties);
+
+		// When creating a table, A hive table needs explicitly have a key is_generic = false
+		// otherwise, this is a generic table if 1) the key is missing 2) is_generic = true
+		// this is opposite to reading a table and instantiating a CatalogTable. See instantiateCatalogTable()
+		boolean isGeneric;
+		if (!properties.containsKey(CatalogConfig.IS_GENERIC)) {
+			// must be a generic table
+			isGeneric = true;
+			properties.put(CatalogConfig.IS_GENERIC, String.valueOf(true));
+		} else {
+			isGeneric = Boolean.parseBoolean(properties.get(CatalogConfig.IS_GENERIC));
+		}
 
 		// Hive table's StorageDescriptor
 		StorageDescriptor sd = hiveTable.getSd();
 		setStorageFormat(sd, properties);
 
-		List<FieldSchema> allColumns = HiveTableUtil.createHiveColumns(table.getSchema());
+		if (isGeneric) {
+			DescriptorProperties tableSchemaProps = new DescriptorProperties(true);
+			tableSchemaProps.putTableSchema(HiveCatalogConfig.GENERIC_TABLE_SCHEMA_PREFIX, table.getSchema());
+			properties.putAll(tableSchemaProps.asMap());
 
-		// Table columns and partition keys
-		if (table instanceof AbstractCatalogTable) {
-			AbstractCatalogTable catalogTable = (AbstractCatalogTable) table;
+			if (table instanceof CatalogTableImpl) {
+				List<String> partColNames = ((CatalogTableImpl) table).getPartitionKeys();
+				if (!partColNames.isEmpty()) {
+					throw new CatalogException("Partitioned generic table is not supported yet by HiveCatalog");
+				}
+			}
 
-			if (catalogTable.isPartitioned()) {
-				int partitionKeySize = catalogTable.getPartitionKeys().size();
-				List<FieldSchema> regularColumns = allColumns.subList(0, allColumns.size() - partitionKeySize);
-				List<FieldSchema> partitionColumns = allColumns.subList(allColumns.size() - partitionKeySize, allColumns.size());
+			properties = maskFlinkProperties(properties);
+		} else {
+			List<FieldSchema> allColumns = HiveTableUtil.createHiveColumns(table.getSchema());
+			// Table columns and partition keys
+			if (table instanceof CatalogTableImpl) {
+				CatalogTable catalogTable = (CatalogTableImpl) table;
 
-				sd.setCols(regularColumns);
-				hiveTable.setPartitionKeys(partitionColumns);
+				if (catalogTable.isPartitioned()) {
+					int partitionKeySize = catalogTable.getPartitionKeys().size();
+					List<FieldSchema> regularColumns = allColumns.subList(0, allColumns.size() - partitionKeySize);
+					List<FieldSchema> partitionColumns = allColumns.subList(allColumns.size() - partitionKeySize, allColumns.size());
+
+					sd.setCols(regularColumns);
+					hiveTable.setPartitionKeys(partitionColumns);
+				} else {
+					sd.setCols(allColumns);
+					hiveTable.setPartitionKeys(new ArrayList<>());
+				}
 			} else {
 				sd.setCols(allColumns);
-				hiveTable.setPartitionKeys(new ArrayList<>());
 			}
-		} else if (table instanceof AbstractCatalogView) {
-			AbstractCatalogView view = (AbstractCatalogView) table;
+		}
 
+		if (table instanceof CatalogViewImpl) {
 			// TODO: [FLINK-12398] Support partitioned view in catalog API
-			sd.setCols(allColumns);
 			hiveTable.setPartitionKeys(new ArrayList<>());
 
+			CatalogView view = (CatalogView) table;
 			hiveTable.setViewOriginalText(view.getOriginalQuery());
 			hiveTable.setViewExpandedText(view.getExpandedQuery());
 			hiveTable.setTableType(TableType.VIRTUAL_VIEW.name());
-		} else {
-			throw new CatalogException(
-				"HiveCatalog only supports HiveCatalogTable and HiveCatalogView");
 		}
+
+		// Table properties
+		hiveTable.setParameters(properties);
 
 		return hiveTable;
 	}
@@ -594,20 +676,25 @@ public class HiveCatalog extends AbstractCatalog {
 
 	/**
 	 * Filter out Hive-created properties, and return Flink-created properties.
+	 * Note that 'is_generic' is a special key and this method will leave it as-is.
 	 */
 	private static Map<String, String> retrieveFlinkProperties(Map<String, String> hiveTableParams) {
 		return hiveTableParams.entrySet().stream()
-			.filter(e -> e.getKey().startsWith(FLINK_PROPERTY_PREFIX))
+			.filter(e -> e.getKey().startsWith(FLINK_PROPERTY_PREFIX) || e.getKey().equals(CatalogConfig.IS_GENERIC))
 			.collect(Collectors.toMap(e -> e.getKey().replace(FLINK_PROPERTY_PREFIX, ""), e -> e.getValue()));
 	}
 
 	/**
 	 * Add a prefix to Flink-created properties to distinguish them from Hive-created properties.
+	 * Note that 'is_generic' is a special key and this method will leave it as-is.
 	 */
 	private static Map<String, String> maskFlinkProperties(Map<String, String> properties) {
 		return properties.entrySet().stream()
 			.filter(e -> e.getKey() != null && e.getValue() != null)
-			.collect(Collectors.toMap(e -> FLINK_PROPERTY_PREFIX + e.getKey(), e -> e.getValue()));
+			.map(e -> new Tuple2<>(
+				e.getKey().equals(CatalogConfig.IS_GENERIC) ? e.getKey() : FLINK_PROPERTY_PREFIX + e.getKey(),
+				e.getValue()))
+			.collect(Collectors.toMap(t -> t.f0, t -> t.f1));
 	}
 
 	// ------ partitions ------
@@ -635,8 +722,10 @@ public class HiveCatalog extends AbstractCatalog {
 		checkNotNull(partitionSpec, "CatalogPartitionSpec cannot be null");
 		checkNotNull(partition, "Partition cannot be null");
 
-		if (!(partition instanceof HiveCatalogPartition)) {
-			throw new CatalogException("Currently only supports HiveCatalogPartition");
+		boolean isGeneric = Boolean.valueOf(partition.getProperties().get(CatalogConfig.IS_GENERIC));
+
+		if (isGeneric) {
+			throw new CatalogException("Currently only supports non-generic CatalogPartition");
 		}
 
 		Table hiveTable = getHiveTable(tablePath);
@@ -710,12 +799,45 @@ public class HiveCatalog extends AbstractCatalog {
 
 		try {
 			// partition spec can be partial
-			List<String> partialVals = MetaStoreUtils.getPvals(hiveTable.getPartitionKeys(), partitionSpec.getPartitionSpec());
+			List<String> partialVals = HiveReflectionUtils.getPvals(hiveShim, hiveTable.getPartitionKeys(),
+				partitionSpec.getPartitionSpec());
 			return client.listPartitionNames(tablePath.getDatabaseName(), tablePath.getObjectName(), partialVals,
 				(short) -1).stream().map(HiveCatalog::createPartitionSpec).collect(Collectors.toList());
 		} catch (TException e) {
 			throw new CatalogException(
 				String.format("Failed to list partitions of table %s", tablePath), e);
+		}
+	}
+
+	@Override
+	public List<CatalogPartitionSpec> listPartitionsByFilter(ObjectPath tablePath, List<Expression> expressions)
+			throws TableNotExistException, TableNotPartitionedException, CatalogException {
+		Table hiveTable = getHiveTable(tablePath);
+		ensurePartitionedTable(tablePath, hiveTable);
+		List<String> partColNames = getFieldNames(hiveTable.getPartitionKeys());
+		Optional<String> filter = HiveTableUtil.makePartitionFilter(
+				getNonPartitionFields(hiveConf, hiveTable).size(), partColNames, expressions, hiveShim);
+		if (!filter.isPresent()) {
+			throw new UnsupportedOperationException(
+					"HiveCatalog is unable to handle the partition filter expressions: " + expressions);
+		}
+		try {
+			PartitionSpecProxy partitionSpec = client.listPartitionSpecsByFilter(
+					tablePath.getDatabaseName(), tablePath.getObjectName(), filter.get(), (short) -1);
+			List<CatalogPartitionSpec> res = new ArrayList<>(partitionSpec.size());
+			PartitionSpecProxy.PartitionIterator partitions = partitionSpec.getPartitionIterator();
+			while (partitions.hasNext()) {
+				Partition partition = partitions.next();
+				Map<String, String> spec = new HashMap<>();
+				for (int i = 0; i < partColNames.size(); i++) {
+					spec.put(partColNames.get(i), partition.getValues().get(i));
+				}
+				res.add(new CatalogPartitionSpec(spec));
+			}
+			return res;
+		} catch (TException e) {
+			throw new UnsupportedOperationException(
+					"Failed to list partition by filter from HMS, filter expressions: " + expressions, e);
 		}
 	}
 
@@ -727,7 +849,14 @@ public class HiveCatalog extends AbstractCatalog {
 
 		try {
 			Partition hivePartition = getHivePartition(tablePath, partitionSpec);
-			return instantiateCatalogPartition(hivePartition);
+
+			Map<String, String> properties = hivePartition.getParameters();
+
+			properties.put(HiveCatalogConfig.PARTITION_LOCATION, hivePartition.getSd().getLocation());
+
+			String comment = properties.remove(HiveCatalogConfig.COMMENT);
+
+			return new CatalogPartitionImpl(properties, comment);
 		} catch (NoSuchObjectException | MetaException | TableNotExistException | PartitionSpecInvalidException e) {
 			throw new PartitionNotExistException(getName(), tablePath, partitionSpec, e);
 		} catch (TException e) {
@@ -743,8 +872,10 @@ public class HiveCatalog extends AbstractCatalog {
 		checkNotNull(partitionSpec, "CatalogPartitionSpec cannot be null");
 		checkNotNull(newPartition, "New partition cannot be null");
 
-		if (!(newPartition instanceof HiveCatalogPartition)) {
-			throw new CatalogException("Currently only supports HiveCatalogPartition");
+		boolean isGeneric = Boolean.valueOf(newPartition.getProperties().get(CatalogConfig.IS_GENERIC));
+
+		if (isGeneric) {
+			throw new CatalogException("Currently only supports non-generic CatalogPartition");
 		}
 
 		// Explicitly check if the partition exists or not
@@ -783,11 +914,12 @@ public class HiveCatalog extends AbstractCatalog {
 
 	// make sure both table and partition are generic, or neither is
 	private static void ensureTableAndPartitionMatch(Table hiveTable, CatalogPartition catalogPartition) {
-		boolean isGeneric = Boolean.valueOf(hiveTable.getParameters().get(FLINK_PROPERTY_IS_GENERIC));
-		if ((isGeneric && catalogPartition instanceof HiveCatalogPartition) ||
-			(!isGeneric && catalogPartition instanceof GenericCatalogPartition)) {
+		boolean tableIsGeneric = Boolean.valueOf(hiveTable.getParameters().get(CatalogConfig.IS_GENERIC));
+		boolean partitionIsGeneric = Boolean.valueOf(catalogPartition.getProperties().get(CatalogConfig.IS_GENERIC));
+
+		if (tableIsGeneric != partitionIsGeneric) {
 			throw new CatalogException(String.format("Cannot handle %s partition for %s table",
-				catalogPartition.getClass().getName(), isGeneric ? "generic" : "non-generic"));
+				catalogPartition.getClass().getName(), tableIsGeneric ? "generic" : "non-generic"));
 		}
 	}
 
@@ -804,20 +936,22 @@ public class HiveCatalog extends AbstractCatalog {
 			}
 		}
 		// TODO: handle GenericCatalogPartition
-		HiveCatalogPartition hiveCatalogPartition = (HiveCatalogPartition) catalogPartition;
 		StorageDescriptor sd = hiveTable.getSd().deepCopy();
-		sd.setLocation(hiveCatalogPartition.getLocation());
-		return HiveTableUtil.createHivePartition(hiveTable.getDbName(), hiveTable.getTableName(), partValues,
-				sd, hiveCatalogPartition.getProperties());
-	}
+		sd.setLocation(catalogPartition.getProperties().remove(HiveCatalogConfig.PARTITION_LOCATION));
 
-	private static CatalogPartition instantiateCatalogPartition(Partition hivePartition) {
-		// TODO: create GenericCatalogPartition for GenericCatalogTable
-		return new HiveCatalogPartition(hivePartition.getParameters(), hivePartition.getSd().getLocation());
+		Map<String, String> properties = new HashMap<>(catalogPartition.getProperties());
+		properties.put(HiveCatalogConfig.COMMENT, catalogPartition.getComment());
+
+		return HiveTableUtil.createHivePartition(
+				hiveTable.getDbName(),
+				hiveTable.getTableName(),
+				partValues,
+				sd,
+				properties);
 	}
 
 	private void ensurePartitionedTable(ObjectPath tablePath, Table hiveTable) throws TableNotPartitionedException {
-		if (hiveTable.getPartitionKeysSize() == 0) {
+		if (!isTablePartitioned(hiveTable)) {
 			throw new TableNotPartitionedException(getName(), tablePath);
 		}
 	}
@@ -842,7 +976,7 @@ public class HiveCatalog extends AbstractCatalog {
 		Map<String, String> spec = new HashMap<>(partKeyVals.length);
 		for (String keyVal : partKeyVals) {
 			String[] kv = keyVal.split("=");
-			spec.put(kv[0], kv[1]);
+			spec.put(unescapePathName(kv[0]), unescapePathName(kv[1]));
 		}
 		return new CatalogPartitionSpec(spec);
 	}
@@ -897,10 +1031,8 @@ public class HiveCatalog extends AbstractCatalog {
 		checkNotNull(function, "function cannot be null");
 
 		Function hiveFunction;
-		if (function instanceof GenericCatalogFunction) {
-			hiveFunction = instantiateHiveFunction(functionPath, (GenericCatalogFunction) function);
-		} else if (function instanceof HiveCatalogFunction) {
-			hiveFunction = instantiateHiveFunction(functionPath, (HiveCatalogFunction) function);
+		if (function instanceof CatalogFunctionImpl) {
+			hiveFunction = instantiateHiveFunction(functionPath, function);
 		} else {
 			throw new CatalogException(
 				String.format("Unsupported catalog function type %s", function.getClass().getName()));
@@ -928,18 +1060,18 @@ public class HiveCatalog extends AbstractCatalog {
 
 		try {
 			CatalogFunction existingFunction = getFunction(functionPath);
-
-			if (existingFunction.getClass() != newFunction.getClass()) {
+			boolean existingType = existingFunction.isGeneric();
+			boolean newType = newFunction.isGeneric();
+			if (existingType != newType) {
 				throw new CatalogException(
-					String.format("Function types don't match. Existing function is '%s' and new function is '%s'.",
-						existingFunction.getClass().getName(), newFunction.getClass().getName()));
+					String.format("Function types don't match. Existing function %s generic, and new function %s generic.",
+						existingType ? "is" : "isn't",
+						newType ? "is" : "isn't"));
 			}
 
 			Function hiveFunction;
-			if (newFunction instanceof GenericCatalogFunction) {
-				hiveFunction = instantiateHiveFunction(functionPath, (GenericCatalogFunction) newFunction);
-			} else if (newFunction instanceof HiveCatalogFunction) {
-				hiveFunction = instantiateHiveFunction(functionPath, (HiveCatalogFunction) newFunction);
+			if (newFunction instanceof CatalogFunctionImpl) {
+				hiveFunction = instantiateHiveFunction(functionPath, newFunction);
 			} else {
 				throw new CatalogException(
 					String.format("Unsupported catalog function type %s", newFunction.getClass().getName()));
@@ -1003,17 +1135,9 @@ public class HiveCatalog extends AbstractCatalog {
 			Function function = client.getFunction(functionPath.getDatabaseName(), functionPath.getObjectName());
 
 			if (function.getClassName().startsWith(FLINK_FUNCTION_PREFIX)) {
-				// TODO: extract more properties from Hive function and add to GenericCatalogFunction's properties
-
-				Map<String, String> properties = new HashMap<>();
-				properties.put(GenericInMemoryCatalog.FLINK_IS_GENERIC_KEY, GenericInMemoryCatalog.FLINK_IS_GENERIC_VALUE);
-
-				return new GenericCatalogFunction(
-					function.getClassName().substring(FLINK_FUNCTION_PREFIX.length()), properties);
+				return new CatalogFunctionImpl(function.getClassName().substring(FLINK_FUNCTION_PREFIX.length()));
 			} else {
-				// TODO: extract more properties from Hive function and add to HiveCatalogFunction's properties
-
-				return new HiveCatalogFunction(function.getClassName());
+				return new CatalogFunctionImpl(function.getClassName());
 			}
 		} catch (NoSuchObjectException e) {
 			throw new FunctionNotExistException(getName(), functionPath, e);
@@ -1037,11 +1161,26 @@ public class HiveCatalog extends AbstractCatalog {
 		}
 	}
 
-	private static Function instantiateHiveFunction(ObjectPath functionPath, GenericCatalogFunction function) {
+	private static Function instantiateHiveFunction(ObjectPath functionPath, CatalogFunction function) {
+
+		boolean isGeneric = function.isGeneric();
+
+		// Hive Function does not have properties map
+		// thus, use a prefix in class name to distinguish Flink and Hive functions
+		String functionClassName = isGeneric ?
+			FLINK_FUNCTION_PREFIX + function.getClassName() :
+			function.getClassName();
+
+		if (!function.getFunctionLanguage().equals(FunctionLanguage.JAVA)) {
+			throw new UnsupportedOperationException("HiveCatalog supports only creating" +
+				" JAVA based function for now");
+		}
+
 		return new Function(
-			functionPath.getObjectName(),
+			// due to https://issues.apache.org/jira/browse/HIVE-22053, we have to normalize function name ourselves
+			functionPath.getObjectName().trim().toLowerCase(),
 			functionPath.getDatabaseName(),
-			FLINK_FUNCTION_PREFIX + function.getClassName(),
+			functionClassName,
 			null,			// Owner name
 			PrincipalType.GROUP,	// Temporarily set to GROUP type because it's required by Hive. May change later
 			(int) (System.currentTimeMillis() / 1000),
@@ -1050,59 +1189,195 @@ public class HiveCatalog extends AbstractCatalog {
 		);
 	}
 
-	private static Function instantiateHiveFunction(ObjectPath functionPath, HiveCatalogFunction function) {
-		return new Function(
-			functionPath.getObjectName(),
-			functionPath.getDatabaseName(),
-			function.getClassName(),
-			null,			// Owner name
-			PrincipalType.GROUP,	// Temporarily set to GROUP type because it's required by Hive. May change later
-			(int) (System.currentTimeMillis() / 1000),
-			FunctionType.JAVA,		// FunctionType only has JAVA now
-			new ArrayList<>()		// Resource URIs
-		);
+	private boolean isTablePartitioned(Table hiveTable) {
+		return hiveTable.getPartitionKeysSize() != 0;
 	}
 
 	// ------ stats ------
 
 	@Override
 	public void alterTableStatistics(ObjectPath tablePath, CatalogTableStatistics tableStatistics, boolean ignoreIfNotExists) throws TableNotExistException, CatalogException {
-
+		try {
+			Table hiveTable = getHiveTable(tablePath);
+			// the stats we put in table parameters will be overridden by HMS in older Hive versions, so error out
+			if (!isTablePartitioned(hiveTable) && hiveVersion.compareTo("1.2.1") < 0) {
+				throw new CatalogException("Alter table stats is not supported in Hive version " + hiveVersion);
+			}
+			// Set table stats
+			if (statsChanged(tableStatistics, hiveTable.getParameters())) {
+				updateStats(tableStatistics, hiveTable.getParameters());
+				client.alter_table(tablePath.getDatabaseName(), tablePath.getObjectName(), hiveTable);
+			}
+		} catch (TableNotExistException e) {
+			if (!ignoreIfNotExists) {
+				throw e;
+			}
+		} catch (TException e) {
+			throw new CatalogException(String.format("Failed to alter table stats of table %s", tablePath.getFullName()), e);
+		}
 	}
 
 	@Override
-	public void alterTableColumnStatistics(ObjectPath tablePath, CatalogColumnStatistics columnStatistics, boolean ignoreIfNotExists) throws TableNotExistException, CatalogException {
+	public void alterTableColumnStatistics(ObjectPath tablePath, CatalogColumnStatistics columnStatistics, boolean ignoreIfNotExists) throws TableNotExistException, CatalogException, TablePartitionedException {
+		try {
+			Table hiveTable = getHiveTable(tablePath);
+			// Set table column stats. This only works for non-partitioned tables.
+			if (!isTablePartitioned(hiveTable)) {
+				client.updateTableColumnStatistics(HiveStatsUtil.createTableColumnStats(hiveTable, columnStatistics.getColumnStatisticsData(), hiveVersion));
+			} else {
+				throw new TablePartitionedException(getName(), tablePath);
+			}
+		} catch (TableNotExistException e) {
+			if (!ignoreIfNotExists) {
+				throw e;
+			}
+		} catch (TException e) {
+			throw new CatalogException(String.format("Failed to alter table column stats of table %s", tablePath.getFullName()), e);
+		}
+	}
 
+	/**
+	 * Determine if statistics need to be updated or not.
+	 * @param newTableStats   new catalog table statistics.
+	 * @param parameters      original hive table statistics parameters.
+	 * @return                whether need to update stats.
+	 */
+	private boolean statsChanged(CatalogTableStatistics newTableStats, Map<String, String> parameters) {
+		return newTableStats.getRowCount() != parsePositiveLongStat(parameters, StatsSetupConst.ROW_COUNT)
+				|| newTableStats.getTotalSize() != parsePositiveLongStat(parameters, StatsSetupConst.TOTAL_SIZE)
+				|| newTableStats.getFileCount() != parsePositiveIntStat(parameters, StatsSetupConst.NUM_FILES)
+				|| newTableStats.getRawDataSize() != parsePositiveLongStat(parameters, StatsSetupConst.NUM_FILES);
+	}
+
+	/**
+	 * Update original table statistics parameters.
+	 * @param newTableStats   new catalog table statistics.
+	 * @param parameters      original hive table statistics parameters.
+	 */
+	private void updateStats(CatalogTableStatistics newTableStats, Map<String, String> parameters) {
+		parameters.put(StatsSetupConst.ROW_COUNT, String.valueOf(newTableStats.getRowCount()));
+		parameters.put(StatsSetupConst.TOTAL_SIZE, String.valueOf(newTableStats.getTotalSize()));
+		parameters.put(StatsSetupConst.NUM_FILES, String.valueOf(newTableStats.getFileCount()));
+		parameters.put(StatsSetupConst.RAW_DATA_SIZE, String.valueOf(newTableStats.getRawDataSize()));
+	}
+
+	private static CatalogTableStatistics createCatalogTableStatistics(Map<String, String> parameters) {
+		return new CatalogTableStatistics(
+				parsePositiveLongStat(parameters, StatsSetupConst.ROW_COUNT),
+				parsePositiveIntStat(parameters, StatsSetupConst.NUM_FILES),
+				parsePositiveLongStat(parameters, StatsSetupConst.TOTAL_SIZE),
+				parsePositiveLongStat(parameters, StatsSetupConst.RAW_DATA_SIZE));
 	}
 
 	@Override
 	public void alterPartitionStatistics(ObjectPath tablePath, CatalogPartitionSpec partitionSpec, CatalogTableStatistics partitionStatistics, boolean ignoreIfNotExists) throws PartitionNotExistException, CatalogException {
-
+		try {
+			Partition hivePartition = getHivePartition(tablePath, partitionSpec);
+			// Set table stats
+			if (statsChanged(partitionStatistics, hivePartition.getParameters())) {
+				updateStats(partitionStatistics, hivePartition.getParameters());
+				client.alter_partition(tablePath.getDatabaseName(), tablePath.getObjectName(), hivePartition);
+			}
+		} catch (TableNotExistException | PartitionSpecInvalidException e) {
+			throw new PartitionNotExistException(getName(), tablePath, partitionSpec, e);
+		} catch (TException e) {
+			throw new CatalogException(String.format("Failed to alter table stats of table %s 's partition %s", tablePath.getFullName(), String.valueOf(partitionSpec)), e);
+		}
 	}
 
 	@Override
 	public void alterPartitionColumnStatistics(ObjectPath tablePath, CatalogPartitionSpec partitionSpec, CatalogColumnStatistics columnStatistics, boolean ignoreIfNotExists) throws PartitionNotExistException, CatalogException {
+		try {
+			Partition hivePartition = getHivePartition(tablePath, partitionSpec);
+			Table hiveTable = getHiveTable(tablePath);
+			String partName = getPartitionName(tablePath, partitionSpec, hiveTable);
+			client.updatePartitionColumnStatistics(HiveStatsUtil.createPartitionColumnStats(
+					hivePartition, partName, columnStatistics.getColumnStatisticsData(), hiveVersion));
+		} catch (TableNotExistException | PartitionSpecInvalidException e) {
+			if (!ignoreIfNotExists) {
+				throw new PartitionNotExistException(getName(), tablePath, partitionSpec, e);
+			}
+		} catch (TException e) {
+			throw new CatalogException(String.format("Failed to alter table column stats of table %s 's partition %s",
+													tablePath.getFullName(), String.valueOf(partitionSpec)), e);
+		}
+	}
 
+	private String getPartitionName(ObjectPath tablePath, CatalogPartitionSpec partitionSpec, Table hiveTable) throws PartitionSpecInvalidException {
+		List<String> partitionCols = getFieldNames(hiveTable.getPartitionKeys());
+		List<String> partitionVals = getOrderedFullPartitionValues(partitionSpec, partitionCols, tablePath);
+		List<String> partKVs = new ArrayList<>();
+		for (int i = 0; i < partitionCols.size(); i++) {
+			partKVs.add(partitionCols.get(i) + "=" + partitionVals.get(i));
+		}
+		return String.join("/", partKVs);
 	}
 
 	@Override
-	public CatalogTableStatistics getTableStatistics(ObjectPath tablePath) throws TableNotExistException, CatalogException {
-		throw new UnsupportedOperationException();
+	public CatalogTableStatistics getTableStatistics(ObjectPath tablePath) throws TableNotExistException,
+			CatalogException {
+		Table hiveTable = getHiveTable(tablePath);
+		if (!isTablePartitioned(hiveTable)) {
+			return createCatalogTableStatistics(hiveTable.getParameters());
+		} else {
+			return CatalogTableStatistics.UNKNOWN;
+		}
 	}
 
 	@Override
 	public CatalogColumnStatistics getTableColumnStatistics(ObjectPath tablePath) throws TableNotExistException, CatalogException {
-		throw new UnsupportedOperationException();
+		Table hiveTable = getHiveTable(tablePath);
+		try {
+			if (!isTablePartitioned(hiveTable)) {
+				List<ColumnStatisticsObj> columnStatisticsObjs = client.getTableColumnStatistics(
+						hiveTable.getDbName(), hiveTable.getTableName(), getFieldNames(hiveTable.getSd().getCols()));
+				return new CatalogColumnStatistics(HiveStatsUtil.createCatalogColumnStats(columnStatisticsObjs, hiveVersion));
+			} else {
+				// TableColumnStats of partitioned table is unknown, the behavior is same as HIVE
+				return CatalogColumnStatistics.UNKNOWN;
+			}
+		} catch (TException e) {
+			throw new CatalogException(String.format("Failed to get table column stats of table %s",
+													tablePath.getFullName()), e);
+		}
 	}
 
 	@Override
 	public CatalogTableStatistics getPartitionStatistics(ObjectPath tablePath, CatalogPartitionSpec partitionSpec) throws PartitionNotExistException, CatalogException {
-		throw new UnsupportedOperationException();
+		try {
+			Partition partition = getHivePartition(tablePath, partitionSpec);
+			return createCatalogTableStatistics(partition.getParameters());
+		} catch (TableNotExistException | PartitionSpecInvalidException e) {
+			throw new PartitionNotExistException(getName(), tablePath, partitionSpec, e);
+		} catch (TException e) {
+			throw new CatalogException(String.format("Failed to get partition stats of table %s 's partition %s",
+													tablePath.getFullName(), String.valueOf(partitionSpec)), e);
+		}
 	}
 
 	@Override
 	public CatalogColumnStatistics getPartitionColumnStatistics(ObjectPath tablePath, CatalogPartitionSpec partitionSpec) throws PartitionNotExistException, CatalogException {
-		throw new UnsupportedOperationException();
+		try {
+			Partition partition = getHivePartition(tablePath, partitionSpec);
+			Table hiveTable = getHiveTable(tablePath);
+			String partName = getPartitionName(tablePath, partitionSpec, hiveTable);
+			List<String> partNames = new ArrayList<>();
+			partNames.add(partName);
+			Map<String, List<ColumnStatisticsObj>> partitionColumnStatistics =
+					client.getPartitionColumnStatistics(partition.getDbName(), partition.getTableName(), partNames,
+														getFieldNames(partition.getSd().getCols()));
+			List<ColumnStatisticsObj> columnStatisticsObjs = partitionColumnStatistics.get(partName);
+			if (columnStatisticsObjs != null && !columnStatisticsObjs.isEmpty()) {
+				return new CatalogColumnStatistics(HiveStatsUtil.createCatalogColumnStats(columnStatisticsObjs, hiveVersion));
+			} else {
+				return CatalogColumnStatistics.UNKNOWN;
+			}
+		} catch (TableNotExistException | PartitionSpecInvalidException e) {
+			throw new PartitionNotExistException(getName(), tablePath, partitionSpec);
+		} catch (TException e) {
+			throw new CatalogException(String.format("Failed to get table stats of table %s 's partition %s",
+													tablePath.getFullName(), String.valueOf(partitionSpec)), e);
+		}
 	}
 
 }

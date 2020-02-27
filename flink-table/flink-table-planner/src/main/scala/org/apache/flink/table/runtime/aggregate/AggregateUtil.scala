@@ -43,7 +43,7 @@ import org.apache.flink.table.expressions._
 import org.apache.flink.table.functions.aggfunctions._
 import org.apache.flink.table.functions.utils.AggSqlFunction
 import org.apache.flink.table.functions.utils.UserDefinedFunctionUtils._
-import org.apache.flink.table.functions.{AggregateFunction, TableAggregateFunction, UserDefinedAggregateFunction, UserFunctionsTypeHelper}
+import org.apache.flink.table.functions.{AggregateFunction, TableAggregateFunction, UserDefinedAggregateFunction, UserDefinedFunctionHelper}
 import org.apache.flink.table.plan.logical._
 import org.apache.flink.table.runtime.types.{CRow, CRowTypeInfo}
 import org.apache.flink.table.typeutils.TimeIntervalTypeInfo
@@ -279,7 +279,6 @@ object AggregateUtil {
       inputFieldTypeInfo: Seq[TypeInformation[_]],
       precedingOffset: Long,
       queryConfig: StreamQueryConfig,
-      tableConfig: TableConfig,
       isRowsClause: Boolean,
       rowTimeIdx: Option[Int])
     : KeyedProcessFunction[K, CRow, CRow] = {
@@ -290,7 +289,7 @@ object AggregateUtil {
         aggregateInputType,
         inputFieldTypeInfo.length,
         needRetract,
-        tableConfig,
+        config,
         isStateBackedDataViews = true)
 
     val inputRowType = CRowTypeInfo(inputTypeInfo)
@@ -1421,7 +1420,7 @@ object AggregateUtil {
     val (accumulatorType, accSpecs) = {
       val accType = aggregateFunction match {
         case udagg: AggSqlFunction => udagg.accType
-        case _ => UserFunctionsTypeHelper.getAccumulatorTypeOfAggregateFunction(aggregate)
+        case _ => UserDefinedFunctionHelper.getAccumulatorTypeOfAggregateFunction(aggregate)
       }
 
       removeStateViewFieldsFromAccTypeInfo(

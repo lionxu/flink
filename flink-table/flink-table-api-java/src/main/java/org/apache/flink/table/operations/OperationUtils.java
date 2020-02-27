@@ -69,7 +69,7 @@ public class OperationUtils {
 	 * @param <T> The type of the child.
 	 * @return String representation of the given operation.
 	 */
-	static <T extends Operation> String formatWithChildren(
+	public static <T extends Operation> String formatWithChildren(
 			String operationName,
 			Map<String, Object> parameters,
 			List<T> children,
@@ -94,7 +94,7 @@ public class OperationUtils {
 		return stringBuilder.append(childrenDescription).toString();
 	}
 
-	private static String formatParameter(String name, Object value) {
+	public static String formatParameter(String name, Object value) {
 		final StringBuilder stringBuilder = new StringBuilder();
 		stringBuilder.append(name);
 		stringBuilder.append(": ");

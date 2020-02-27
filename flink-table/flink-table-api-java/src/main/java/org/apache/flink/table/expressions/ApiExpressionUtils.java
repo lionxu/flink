@@ -22,9 +22,15 @@ import org.apache.flink.annotation.Internal;
 import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.api.Table;
 import org.apache.flink.table.api.ValidationException;
+import org.apache.flink.table.functions.BuiltInFunctionDefinition;
+import org.apache.flink.table.functions.FunctionDefinition;
+import org.apache.flink.table.functions.FunctionIdentifier;
+import org.apache.flink.table.functions.FunctionKind;
+import org.apache.flink.table.operations.QueryOperation;
 import org.apache.flink.table.types.DataType;
 
 import java.util.Arrays;
+import java.util.List;
 
 /**
  * Utilities for API-specific {@link Expression}s.
@@ -38,14 +44,14 @@ public final class ApiExpressionUtils {
 
 	public static final long MILLIS_PER_HOUR = 3600000L; // = 60 * 60 * 1000
 
-	public static final long MILLIS_PER_DAY = 86400000; // = 24 * 60 * 60 * 1000
+	public static final long MILLIS_PER_DAY = 86400000L; // = 24 * 60 * 60 * 1000
 
 	private ApiExpressionUtils() {
 		// private
 	}
 
-	public static CallExpression call(FunctionDefinition functionDefinition, Expression... args) {
-		return new CallExpression(functionDefinition, Arrays.asList(args));
+	public static LocalReferenceExpression localRef(String name, DataType dataType) {
+		return new LocalReferenceExpression(name, dataType);
 	}
 
 	public static ValueLiteralExpression valueLiteral(Object value) {
@@ -64,8 +70,34 @@ public final class ApiExpressionUtils {
 		return new UnresolvedReferenceExpression(name);
 	}
 
+	public static UnresolvedCallExpression unresolvedCall(
+			FunctionIdentifier functionIdentifier,
+			FunctionDefinition functionDefinition,
+			Expression... args) {
+		return new UnresolvedCallExpression(functionIdentifier, functionDefinition, Arrays.asList(args));
+	}
+
+	public static UnresolvedCallExpression unresolvedCall(
+			FunctionIdentifier functionIdentifier,
+			FunctionDefinition functionDefinition,
+			List<Expression> args) {
+		return new UnresolvedCallExpression(functionIdentifier, functionDefinition, args);
+	}
+
+	public static UnresolvedCallExpression unresolvedCall(FunctionDefinition functionDefinition, Expression... args) {
+		return unresolvedCall(functionDefinition, Arrays.asList(args));
+	}
+
+	public static UnresolvedCallExpression unresolvedCall(FunctionDefinition functionDefinition, List<Expression> args) {
+		return new UnresolvedCallExpression(functionDefinition, args);
+	}
+
 	public static TableReferenceExpression tableRef(String name, Table table) {
-		return new TableReferenceExpression(name, table.getQueryOperation());
+		return tableRef(name, table.getQueryOperation());
+	}
+
+	public static TableReferenceExpression tableRef(String name, QueryOperation queryOperation) {
+		return new TableReferenceExpression(name, queryOperation);
 	}
 
 	public static LookupCallExpression lookupCall(String name, Expression... args) {
@@ -100,5 +132,39 @@ public final class ApiExpressionUtils {
 		return ExpressionUtils.extractValue(e, Long.class)
 			.map(ApiExpressionUtils::valueLiteral)
 			.orElseThrow(() -> new ValidationException("Invalid constant for row interval: " + e));
+	}
+
+	/**
+	 * Checks if the expression is a function call of given type.
+	 *
+	 * @param expression expression to check
+	 * @param kind expected type of function
+	 * @return true if the expression is function call of given type, false otherwise
+	 */
+	public static boolean isFunctionOfKind(Expression expression, FunctionKind kind) {
+		if (expression instanceof UnresolvedCallExpression) {
+			return ((UnresolvedCallExpression) expression).getFunctionDefinition().getKind() == kind;
+		}
+		if (expression instanceof CallExpression) {
+			return ((CallExpression) expression).getFunctionDefinition().getKind() == kind;
+		}
+		return false;
+	}
+
+	/**
+	 * Checks if the given expression is a given builtin function.
+	 *
+	 * @param expression expression to check
+	 * @param functionDefinition expected function definition
+	 * @return true if the given expression is a given function call
+	 */
+	public static boolean isFunction(Expression expression, BuiltInFunctionDefinition functionDefinition) {
+		if (expression instanceof UnresolvedCallExpression) {
+			return ((UnresolvedCallExpression) expression).getFunctionDefinition() == functionDefinition;
+		}
+		if (expression instanceof CallExpression) {
+			return ((CallExpression) expression).getFunctionDefinition() == functionDefinition;
+		}
+		return false;
 	}
 }

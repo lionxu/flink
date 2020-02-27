@@ -23,11 +23,8 @@ import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.api.TableException;
 import org.apache.flink.table.api.TableSchema;
-import org.apache.flink.table.plan.stats.TableStats;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.utils.TableConnectorUtils;
-
-import java.util.Optional;
 
 import static org.apache.flink.table.types.utils.TypeConversions.fromLegacyInfoToDataType;
 
@@ -76,7 +73,10 @@ public interface TableSource<T> {
 	 * Returns the schema of the produced table.
 	 *
 	 * @return The {@link TableSchema} of the produced table.
+	 * @deprecated Table schema is a logical description of a table and should not be part of the physical TableSource.
+	 *             Define schema when registering a Table either in DDL or in {@code TableEnvironment#connect(...)}.
 	 */
+	@Deprecated
 	TableSchema getTableSchema();
 
 	/**
@@ -86,12 +86,5 @@ public interface TableSource<T> {
 	 */
 	default String explainSource() {
 		return TableConnectorUtils.generateRuntimeName(getClass(), getTableSchema().getFieldNames());
-	}
-
-	/**
-	 * Returns the (optional) statistics for this {@link TableSource}.
-	 */
-	default Optional<TableStats> getTableStats() {
-		return Optional.empty();
 	}
 }

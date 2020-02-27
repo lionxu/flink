@@ -21,6 +21,7 @@ import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.common.ExecutionConfig;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.java.typeutils.InputTypeConfigurable;
+import org.apache.flink.streaming.api.functions.sink.OutputFormatSinkFunction;
 import org.apache.flink.streaming.api.functions.source.InputFormatSourceFunction;
 import org.apache.flink.streaming.api.graph.StreamConfig;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
@@ -34,19 +35,23 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
  * @param <OUT> The output type of the operator
  */
 @Internal
-public class SimpleOperatorFactory<OUT> implements StreamOperatorFactory<OUT> {
+public class SimpleOperatorFactory<OUT> extends AbstractStreamOperatorFactory<OUT> {
 
 	private final StreamOperator<OUT> operator;
 
 	/**
 	 * Create a SimpleOperatorFactory from existed StreamOperator.
 	 */
+	@SuppressWarnings("unchecked")
 	public static <OUT> SimpleOperatorFactory<OUT> of(StreamOperator<OUT> operator) {
 		if (operator == null) {
 			return null;
 		} else if (operator instanceof StreamSource &&
 				((StreamSource) operator).getUserFunction() instanceof InputFormatSourceFunction) {
 			return new SimpleInputFormatOperatorFactory<OUT>((StreamSource) operator);
+		} else if (operator instanceof StreamSink &&
+			((StreamSink) operator).getUserFunction() instanceof OutputFormatSinkFunction) {
+			return new SimpleOutputFormatOperatorFactory<>((StreamSink) operator);
 		} else if (operator instanceof AbstractUdfStreamOperator) {
 			return new SimpleUdfStreamOperatorFactory<OUT>((AbstractUdfStreamOperator) operator);
 		} else {
@@ -56,6 +61,7 @@ public class SimpleOperatorFactory<OUT> implements StreamOperatorFactory<OUT> {
 
 	protected SimpleOperatorFactory(StreamOperator<OUT> operator) {
 		this.operator = checkNotNull(operator);
+		this.chainingStrategy = operator.getChainingStrategy();
 	}
 
 	public StreamOperator<OUT> getOperator() {
@@ -66,6 +72,9 @@ public class SimpleOperatorFactory<OUT> implements StreamOperatorFactory<OUT> {
 	@Override
 	public <T extends StreamOperator<OUT>> T createStreamOperator(StreamTask<?, ?> containingTask,
 			StreamConfig config, Output<StreamRecord<OUT>> output) {
+		if (operator instanceof AbstractStreamOperator) {
+			((AbstractStreamOperator) operator).setProcessingTimeService(processingTimeService);
+		}
 		if (operator instanceof SetupableStreamOperator) {
 			((SetupableStreamOperator) operator).setup(containingTask, config, output);
 		}
@@ -74,22 +83,13 @@ public class SimpleOperatorFactory<OUT> implements StreamOperatorFactory<OUT> {
 
 	@Override
 	public void setChainingStrategy(ChainingStrategy strategy) {
+		this.chainingStrategy = strategy;
 		operator.setChainingStrategy(strategy);
-	}
-
-	@Override
-	public ChainingStrategy getChainingStrategy() {
-		return operator.getChainingStrategy();
 	}
 
 	@Override
 	public boolean isStreamSource() {
 		return operator instanceof StreamSource;
-	}
-
-	@Override
-	public boolean isOperatorSelectiveReading() {
-		return operator instanceof InputSelectable;
 	}
 
 	@Override
@@ -111,5 +111,10 @@ public class SimpleOperatorFactory<OUT> implements StreamOperatorFactory<OUT> {
 	@Override
 	public void setInputType(TypeInformation<?> type, ExecutionConfig executionConfig) {
 		((InputTypeConfigurable) operator).setInputType(type, executionConfig);
+	}
+
+	@Override
+	public Class<? extends StreamOperator> getStreamOperatorClass(ClassLoader classLoader) {
+		return operator.getClass();
 	}
 }

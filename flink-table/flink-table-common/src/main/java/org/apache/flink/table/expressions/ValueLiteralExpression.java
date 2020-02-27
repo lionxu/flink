@@ -21,6 +21,7 @@ package org.apache.flink.table.expressions;
 import org.apache.flink.annotation.PublicEvolving;
 import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.types.DataType;
+import org.apache.flink.table.types.inference.CallContext;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.utils.ValueDataTypeConverter;
 import org.apache.flink.table.utils.EncodingUtils;
@@ -52,7 +53,7 @@ import java.util.stream.Stream;
  * <p>Symbols (enums extending from {@link TableSymbol}) are considered as literal values.
  */
 @PublicEvolving
-public final class ValueLiteralExpression implements Expression {
+public final class ValueLiteralExpression implements ResolvedExpression {
 
 	private final @Nullable Object value;
 
@@ -68,48 +69,15 @@ public final class ValueLiteralExpression implements Expression {
 		this.dataType = dataType;
 	}
 
-	public DataType getOutputDataType() {
-		return dataType;
-	}
-
-	@Override
-	public List<Expression> getChildren() {
-		return Collections.emptyList();
-	}
-
-	@Override
-	public <R> R accept(ExpressionVisitor<R> visitor) {
-		return visitor.visitValueLiteral(this);
-	}
-
-	@Override
-	public boolean equals(Object o) {
-		if (this == o) {
-			return true;
-		}
-		if (o == null || getClass() != o.getClass()) {
-			return false;
-		}
-		ValueLiteralExpression that = (ValueLiteralExpression) o;
-		return Objects.equals(value, that.value) && dataType.equals(that.dataType);
-	}
-
-	@Override
-	public int hashCode() {
-		return Objects.hash(value, dataType);
-	}
-
-	@Override
-	public String toString() {
-		return stringifyValue(value);
-	}
-
 	public boolean isNull() {
 		return value == null;
 	}
 
 	/**
 	 * Returns the value (excluding null) as an instance of the given class.
+	 *
+	 * <p>Note to implementers: Whenever we add a new class here, make sure to also update the planner
+	 * for supporting the class via {@link CallContext#getArgumentValue(int, Class)}.
 	 */
 	@SuppressWarnings("unchecked")
 	public <T> Optional<T> getValueAs(Class<T> clazz) {
@@ -142,7 +110,7 @@ public final class ValueLiteralExpression implements Expression {
 
 		else if (valueClass == Period.class && clazz == Integer.class) {
 			final Period period = (Period) value;
-			convertedValue = period.toTotalMonths();
+			convertedValue = (int) period.toTotalMonths();
 		}
 
 		else if (valueClass == Integer.class && clazz == Period.class) {
@@ -186,7 +154,55 @@ public final class ValueLiteralExpression implements Expression {
 
 		// we can offer more conversions in the future, these conversions must not necessarily
 		// comply with the logical type conversions
+
 		return Optional.ofNullable((T) convertedValue);
+	}
+
+	@Override
+	public DataType getOutputDataType() {
+		return dataType;
+	}
+
+	@Override
+	public List<ResolvedExpression> getResolvedChildren() {
+		return Collections.emptyList();
+	}
+
+	@Override
+	public String asSummaryString() {
+		return stringifyValue(value);
+	}
+
+	@Override
+	public List<Expression> getChildren() {
+		return Collections.emptyList();
+	}
+
+	@Override
+	public <R> R accept(ExpressionVisitor<R> visitor) {
+		return visitor.visit(this);
+	}
+
+	@Override
+	public boolean equals(Object o) {
+		if (this == o) {
+			return true;
+		}
+		if (o == null || getClass() != o.getClass()) {
+			return false;
+		}
+		ValueLiteralExpression that = (ValueLiteralExpression) o;
+		return Objects.deepEquals(value, that.value) && dataType.equals(that.dataType);
+	}
+
+	@Override
+	public int hashCode() {
+		return Objects.hash(value, dataType);
+	}
+
+	@Override
+	public String toString() {
+		return asSummaryString();
 	}
 
 	// --------------------------------------------------------------------------------------------

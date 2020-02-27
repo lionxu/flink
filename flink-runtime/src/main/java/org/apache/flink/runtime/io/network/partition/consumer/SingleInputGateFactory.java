@@ -24,6 +24,7 @@ import org.apache.flink.runtime.deployment.InputGateDeploymentDescriptor;
 import org.apache.flink.runtime.io.network.ConnectionManager;
 import org.apache.flink.runtime.io.network.NettyShuffleEnvironment;
 import org.apache.flink.runtime.io.network.TaskEventPublisher;
+import org.apache.flink.runtime.io.network.buffer.BufferDecompressor;
 import org.apache.flink.runtime.io.network.buffer.BufferPool;
 import org.apache.flink.runtime.io.network.buffer.BufferPoolFactory;
 import org.apache.flink.runtime.io.network.buffer.NetworkBufferPool;
@@ -50,46 +51,52 @@ import static org.apache.flink.runtime.shuffle.ShuffleUtils.applyWithShuffleType
  * Factory for {@link SingleInputGate} to use in {@link NettyShuffleEnvironment}.
  */
 public class SingleInputGateFactory {
-	private static final Logger LOG = LoggerFactory.getLogger(SingleInputGate.class);
+	private static final Logger LOG = LoggerFactory.getLogger(SingleInputGateFactory.class);
 
 	@Nonnull
-	private final ResourceID taskExecutorLocation;
+	protected final ResourceID taskExecutorResourceId;
 
-	private final boolean isCreditBased;
+	protected final int partitionRequestInitialBackoff;
 
-	private final int partitionRequestInitialBackoff;
-
-	private final int partitionRequestMaxBackoff;
+	protected final int partitionRequestMaxBackoff;
 
 	@Nonnull
-	private final ConnectionManager connectionManager;
+	protected final ConnectionManager connectionManager;
 
 	@Nonnull
-	private final ResultPartitionManager partitionManager;
+	protected final ResultPartitionManager partitionManager;
 
 	@Nonnull
-	private final TaskEventPublisher taskEventPublisher;
+	protected final TaskEventPublisher taskEventPublisher;
 
 	@Nonnull
-	private final NetworkBufferPool networkBufferPool;
+	protected final NetworkBufferPool networkBufferPool;
 
 	private final int networkBuffersPerChannel;
 
 	private final int floatingNetworkBuffersPerGate;
 
+	private final boolean blockingShuffleCompressionEnabled;
+
+	private final String compressionCodec;
+
+	private final int networkBufferSize;
+
 	public SingleInputGateFactory(
-			@Nonnull ResourceID taskExecutorLocation,
+			@Nonnull ResourceID taskExecutorResourceId,
 			@Nonnull NettyShuffleEnvironmentConfiguration networkConfig,
 			@Nonnull ConnectionManager connectionManager,
 			@Nonnull ResultPartitionManager partitionManager,
 			@Nonnull TaskEventPublisher taskEventPublisher,
 			@Nonnull NetworkBufferPool networkBufferPool) {
-		this.taskExecutorLocation = taskExecutorLocation;
-		this.isCreditBased = networkConfig.isCreditBased();
+		this.taskExecutorResourceId = taskExecutorResourceId;
 		this.partitionRequestInitialBackoff = networkConfig.partitionRequestInitialBackoff();
 		this.partitionRequestMaxBackoff = networkConfig.partitionRequestMaxBackoff();
 		this.networkBuffersPerChannel = networkConfig.networkBuffersPerChannel();
 		this.floatingNetworkBuffersPerGate = networkConfig.floatingNetworkBuffersPerGate();
+		this.blockingShuffleCompressionEnabled = networkConfig.isBlockingShuffleCompressionEnabled();
+		this.compressionCodec = networkConfig.getCompressionCodec();
+		this.networkBufferSize = networkConfig.networkBufferSize();
 		this.connectionManager = connectionManager;
 		this.partitionManager = partitionManager;
 		this.taskEventPublisher = taskEventPublisher;
@@ -106,11 +113,15 @@ public class SingleInputGateFactory {
 			@Nonnull InputChannelMetrics metrics) {
 		SupplierWithException<BufferPool, IOException> bufferPoolFactory = createBufferPoolFactory(
 			networkBufferPool,
-			isCreditBased,
 			networkBuffersPerChannel,
 			floatingNetworkBuffersPerGate,
 			igdd.getShuffleDescriptors().length,
 			igdd.getConsumedPartitionType());
+
+		BufferDecompressor bufferDecompressor = null;
+		if (igdd.getConsumedPartitionType().isBlocking() && blockingShuffleCompressionEnabled) {
+			bufferDecompressor = new BufferDecompressor(networkBufferSize, compressionCodec);
+		}
 
 		SingleInputGate inputGate = new SingleInputGate(
 			owningTaskName,
@@ -119,8 +130,8 @@ public class SingleInputGateFactory {
 			igdd.getConsumedSubpartitionIndex(),
 			igdd.getShuffleDescriptors().length,
 			partitionProducerStateProvider,
-			isCreditBased,
-			bufferPoolFactory);
+			bufferPoolFactory,
+			bufferDecompressor);
 
 		createInputChannels(owningTaskName, igdd, inputGate, metrics);
 		return inputGate;
@@ -187,14 +198,15 @@ public class SingleInputGateFactory {
 					metrics));
 	}
 
-	private InputChannel createKnownInputChannel(
+	@VisibleForTesting
+	protected InputChannel createKnownInputChannel(
 			SingleInputGate inputGate,
 			int index,
 			NettyShuffleDescriptor inputChannelDescriptor,
 			ChannelStatistics channelStatistics,
 			InputChannelMetrics metrics) {
 		ResultPartitionID partitionId = inputChannelDescriptor.getResultPartitionID();
-		if (inputChannelDescriptor.isLocalTo(taskExecutorLocation)) {
+		if (inputChannelDescriptor.isLocalTo(taskExecutorResourceId)) {
 			// Consuming task is deployed to the same TaskManager as the partition => local
 			channelStatistics.numLocalChannels++;
 			return new LocalInputChannel(
@@ -225,25 +237,20 @@ public class SingleInputGateFactory {
 	@VisibleForTesting
 	static SupplierWithException<BufferPool, IOException> createBufferPoolFactory(
 			BufferPoolFactory bufferPoolFactory,
-			boolean isCreditBased,
 			int networkBuffersPerChannel,
 			int floatingNetworkBuffersPerGate,
 			int size,
 			ResultPartitionType type) {
-		if (isCreditBased) {
-			int maxNumberOfMemorySegments = type.isBounded() ? floatingNetworkBuffersPerGate : Integer.MAX_VALUE;
-			return () -> bufferPoolFactory.createBufferPool(0, maxNumberOfMemorySegments);
-		} else {
-			int maxNumberOfMemorySegments = type.isBounded() ?
-				size * networkBuffersPerChannel + floatingNetworkBuffersPerGate : Integer.MAX_VALUE;
-			return () -> bufferPoolFactory.createBufferPool(size, maxNumberOfMemorySegments);
-		}
+		return () -> bufferPoolFactory.createBufferPool(0, floatingNetworkBuffersPerGate);
 	}
 
-	private static class ChannelStatistics {
-		int numLocalChannels = 0;
-		int numRemoteChannels = 0;
-		int numUnknownChannels = 0;
+	/**
+	 * Statistics of input channels.
+	 */
+	protected static class ChannelStatistics {
+		int numLocalChannels;
+		int numRemoteChannels;
+		int numUnknownChannels;
 
 		@Override
 		public String toString() {
